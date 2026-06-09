@@ -1,0 +1,92 @@
+# QNAP CSI node — a SYSTEM job (daemonset; runs on every client). Performs iSCSI
+# login + multipath assembly + format/mount. Pairs with
+# csi-qnap-controller.nomad.hcl under the same plugin_id.
+#
+# Privileged + /dev so the cgroup device controller permits the iSCSI/multipath
+# (dm) devices; host networking to reach the iSCSI portal. The node reads the
+# portal/IQN from the CSI volume context, so its config needs no appliance
+# creds — an empty qnap{} block is enough.
+
+variable "image" {
+  type = string
+}
+
+variable "plugin_id" {
+  type    = string
+  default = "nomad-csi-driver-qnap"
+}
+
+variable "metrics_enabled" {
+  type        = bool
+  default     = true
+  description = "Expose the node's own Prometheus /metrics endpoint. The e2e observability suite scrapes it."
+}
+
+variable "metrics_address" {
+  type        = string
+  default     = "0.0.0.0:9502"
+  description = "host:port the node's /metrics endpoint binds (host networking). Distinct from the controller's :9501 so a co-located controller+node don't collide."
+}
+
+job "nomad-csi-driver-qnap-node" {
+  type = "system"
+
+  group "node" {
+    task "plugin" {
+      driver = "docker"
+
+      config {
+        image        = var.image
+        force_pull   = true
+        privileged   = true
+        network_mode = "host"
+        args = [
+          "run",
+          "--driver=qnap",
+          "--mode=node",
+          "--node-id=${node.unique.name}",
+          "--config=/local/config.hcl",
+          "--log-level=debug",
+        ]
+        # No explicit /dev mount: privileged already bind-mounts the host /dev
+        # (iSCSI/multipath device nodes); adding it would be a "Duplicate mount
+        # point: /dev" error.
+        #
+        # iSCSI/multipath are HOST-side (kernel modules + iscsid + multipathd run
+        # on the host). With network_mode=host the container's
+        # iscsiadm/multipathd reach the host daemons over the shared
+        # netns; these bind-mounts share the host's iSCSI config/initiator + the
+        # multipath drop-in dir the driver writes its QNAP profile into.
+        volumes = [
+          "/etc/iscsi:/etc/iscsi",       # initiatorname + node db (host iscsid config)
+          "/etc/multipath:/etc/multipath", # driver writes conf.d/<profile>; multipathd reads it
+          "/run/lock:/run/lock",         # iscsiadm/multipathd lock files
+        ]
+      }
+
+      template {
+        destination = "local/config.hcl"
+        data        = <<EOH
+qnap {}
+%{ if var.metrics_enabled ~}
+metrics {
+  enabled = true
+  address = "${var.metrics_address}"
+}
+%{ endif ~}
+EOH
+      }
+
+      csi_plugin {
+        id        = var.plugin_id
+        type      = "node"
+        mount_dir = "/csi"
+      }
+
+      resources {
+        cpu    = 200
+        memory = 256
+      }
+    }
+  }
+}
