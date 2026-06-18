@@ -28,6 +28,12 @@ variable "metrics_address" {
   description = "host:port the node's /metrics endpoint binds (host networking). Distinct from the controller's :9501 so a co-located controller+node don't collide."
 }
 
+variable "forward_secret" {
+  type        = string
+  default     = "e2e-secret-qnap"
+  description = "Shared secret for the per-volume stats forwarding transport (controller fans out to nodes). Must match the controller. Distinct from the local backend's :9602 secret."
+}
+
 job "nomad-csi-driver-qnap-node" {
   type = "system"
 
@@ -67,13 +73,26 @@ job "nomad-csi-driver-qnap-node" {
       template {
         destination = "local/config.hcl"
         data        = <<EOH
-qnap {}
+qnap {
+  # The node reads volume/iSCSI details from the CSI volume context; it only needs
+  # the stats forwarding server config here so the controller can pull its
+  # per-volume readings. Port :9612 is distinct from the local backend's :9602.
+  forward_secret = "${var.forward_secret}"
+  forward_addr   = ":9612"
+}
 %{ if var.metrics_enabled ~}
 metrics {
   enabled = true
   address = "${var.metrics_address}"
 }
 %{ endif ~}
+# Shortened stats cadences for the e2e suite (production defaults are 60s/5m).
+stats {
+  interval      = "5s"
+  walk_interval = "10s"
+  walk_timeout  = "2m"
+  stale_after   = "30s"
+}
 EOH
       }
 

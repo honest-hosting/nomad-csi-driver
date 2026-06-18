@@ -15,6 +15,7 @@ import (
 	"github.com/honest-hosting/nomad-csi-driver/internal/metrics"
 	"github.com/honest-hosting/nomad-csi-driver/internal/mountutil"
 	"github.com/honest-hosting/nomad-csi-driver/internal/multipath"
+	"github.com/honest-hosting/nomad-csi-driver/internal/stats"
 )
 
 // node implements driver.NodeBackend for the qnap backend: iSCSI login,
@@ -30,6 +31,7 @@ type node struct {
 	log          *zap.Logger
 	metrics      *qnapNodeMetrics     // qnap-specific (login/stage/rescan/device); nil-safe
 	nodeM        *metrics.NodeMetrics // shared node metrics (staged count); nil-safe
+	stats        *stats.Registry      // per-volume usage stats; nil-safe no-op when disabled
 
 	// waitForPath polls until path exists and returns its resolved real path.
 	// Overridable in tests; defaults to an os-backed poller.
@@ -40,6 +42,7 @@ func (n *node) StageVolume(ctx context.Context, req *driver.StageRequest) (err e
 	defer func() {
 		if err == nil {
 			n.nodeM.StagedInc()
+			n.stats.Track(req.VolumeID, req.StagingTargetPath, stageAccessType(req.VolumeCapability.AccessType))
 		}
 	}()
 	dev, meta, err := n.attach(ctx, req.VolumeContext)
@@ -73,6 +76,7 @@ func (n *node) UnstageVolume(ctx context.Context, req *driver.UnstageRequest) er
 	if err := n.mounter.Unmount(ctx, req.StagingTargetPath); err != nil {
 		return driver.Internal("unmount staging: %v", err)
 	}
+	n.stats.Untrack(req.VolumeID)
 	meta, err := n.meta.Load(req.VolumeID)
 	if err != nil {
 		// No metadata: the volume was never staged here (or already cleaned).
@@ -194,6 +198,14 @@ func (n *node) loginPortals(ctx context.Context, portals []string, iqn string) (
 			zap.String("iqn", iqn), zap.Int("paths", len(active)), zap.Strings("portals", active))
 	}
 	return active, nil
+}
+
+// stageAccessType maps the CSI access type to the stats access-type label.
+func stageAccessType(at driver.AccessType) string {
+	if at == driver.AccessTypeBlock {
+		return stats.AccessBlock
+	}
+	return stats.AccessMount
 }
 
 // splitPortals parses the comma-separated portal list from the volume context.

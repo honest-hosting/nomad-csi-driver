@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/hashicorp/hcl/v2/hclsimple"
+
+	"github.com/honest-hosting/nomad-csi-driver/internal/stats"
 )
 
 // Config is the top-level deployment config. Both backend blocks are optional;
@@ -21,6 +23,7 @@ type Config struct {
 	Local     *LocalConfig     `hcl:"local,block"`
 	Metrics   *MetricsConfig   `hcl:"metrics,block"`
 	Readiness *ReadinessConfig `hcl:"readiness,block"`
+	Stats     *StatsConfig     `hcl:"stats,block"`
 }
 
 // QNAPConfig holds the --driver=qnap controller/node settings. Credentials live
@@ -59,6 +62,24 @@ type QNAPConfig struct {
 	// `qnapctl --debug-http`). Verbose and may include appliance data — enable
 	// only for troubleshooting, and run with --log-level=debug to see it.
 	DebugHTTP bool `hcl:"debug_http,optional"`
+
+	// --- per-volume stats forwarding (controller fan-out → node daemons) ---
+	// These mirror the local backend's forwarding transport. They are only used
+	// by the usage-stats subsystem: the node runs a forwarding server, and the
+	// controller fans out to all nodes to aggregate readings. Unset = the stats
+	// query API / central /metrics for qnap are disabled (node-local hydration
+	// still runs).
+
+	// ForwardSecret is the shared secret authenticating stats forwards between the
+	// controller and node daemons. Required to enable the qnap stats fan-out.
+	ForwardSecret string `hcl:"forward_secret,optional"`
+	// ForwardAddr is the address a node's stats forwarding server listens on
+	// (host:port), reachable by the controller. Cluster-uniform. Defaults to ":9602".
+	ForwardAddr string `hcl:"forward_addr,optional"`
+	// Nomad tunes node discovery via the Nomad task API (api.sock) on the
+	// controller. Optional; the zero value resolves api.sock + token from
+	// NOMAD_SECRETS_DIR and scopes to $NOMAD_DC.
+	Nomad *NomadConfig `hcl:"nomad,block"`
 }
 
 // PortalList returns the effective iSCSI portals: Portals if set, otherwise the
@@ -95,17 +116,11 @@ type LocalConfig struct {
 	// PoolConfig). 0 = no reserve. This is agent config, never a volume parameter.
 	ReservePercent int `hcl:"reserve_percent,optional"`
 	// Nomad tunes peer discovery via the Nomad task API (api.sock). It is
-	// optional: when omitted, discovery runs with defaults. Discovery is the
-	// single automatic mechanism for the L4 forwarding layer — there is no
-	// enable/disable toggle; a static peer table (Peers) is how you opt out.
+	// optional: when omitted, discovery runs with defaults. Discovery via the
+	// task API + workload identity is the ONLY peer-discovery mechanism for the
+	// L4 forwarding layer (the plugin task therefore requires an `identity`
+	// block, and `node:read` with ACLs on).
 	Nomad *NomadConfig `hcl:"nomad,block"`
-	// Peers is a static peer table — the opt-in override for peer discovery,
-	// used for fixed clusters that hard-code addresses (e.g. when Nomad's
-	// advertised address is not the forwarding path) or for running outside
-	// Nomad (no api.sock). When non-empty it takes precedence over Nomad
-	// discovery. Each node ships the same table; only its own node id (Self)
-	// differs.
-	Peers []PeerConfig `hcl:"peer,block"`
 	// ForwardAddr is the address this node's forwarding server listens on
 	// (host:port), reachable by peer controllers. Defaults to ":9602".
 	ForwardAddr string `hcl:"forward_addr,optional"`
@@ -177,13 +192,6 @@ type NomadConfig struct {
 	NodeFilter string `hcl:"node_filter,optional"`
 	// CacheTTL is how long a fetched roster is reused before refresh. Default 5m.
 	CacheTTL string `hcl:"cache_ttl,optional"`
-}
-
-// PeerConfig is one entry in a static peer table: a node name and the
-// host:port of that node's forwarding server.
-type PeerConfig struct {
-	Node string `hcl:"node,label"`
-	Addr string `hcl:"addr"`
 }
 
 // Default Prometheus endpoint settings, applied when metrics are enabled but the
@@ -260,6 +268,116 @@ func (c *Config) ResolveReadiness() (timeout, interval time.Duration, err error)
 		interval = DefaultReadinessInterval
 	}
 	return timeout, interval, nil
+}
+
+// StatsConfig is the HCL form of the per-volume usage-stats subsystem (see
+// internal/stats). All fields are optional; ResolveStats applies defaults. The
+// three toggles are *bool so an omitted value defaults ON (nil) while an explicit
+// false disables. QueryAddr is *string so an omitted value defaults to :9610
+// while an explicit "" disables the query endpoint.
+type StatsConfig struct {
+	Enabled           *bool   `hcl:"enabled,optional"`             // default ON
+	Interval          string  `hcl:"interval,optional"`            // statfs cadence; default 60s
+	StatfsTimeout     string  `hcl:"statfs_timeout,optional"`      // hung-mount watchdog; default 30s
+	WalkEnabled       *bool   `hcl:"walk_enabled,optional"`        // default ON
+	WalkInterval      string  `hcl:"walk_interval,optional"`       // tree-walk cadence; default 5m
+	WalkWorkers       int     `hcl:"walk_workers,optional"`        // shared pool size; default 4
+	WalkBuffer        int     `hcl:"walk_buffer,optional"`         // backlog hint; default 4096
+	WalkTimeout       string  `hcl:"walk_timeout,optional"`        // per-volume walk deadline; default 10m
+	StaleAfter        string  `hcl:"stale_after,optional"`         // staleness threshold; default 5m
+	MaxFailureBackoff string  `hcl:"max_failure_backoff,optional"` // backoff cap; default 30m
+	AggregateInterval string  `hcl:"aggregate_interval,optional"`  // qnap controller fan-out; default 60s
+	MetricsPerVolume  *bool   `hcl:"metrics_per_volume,optional"`  // default ON
+	QueryAddr         *string `hcl:"query_addr,optional"`          // default :9610; "" disables
+	QueryToken        string  `hcl:"query_token,optional"`         // "" / unset = open (no auth)
+	QueryTokenHeader  string  `hcl:"query_token_header,optional"`  // default X-NCD-Query-Token
+	Namespace         string  `hcl:"namespace,optional"`           // Nomad namespace for id resolution; default "default"
+}
+
+// ResolveStats returns the parsed, defaulted runtime stats config. It is
+// nil-safe (no stats block → all defaults: enabled, walk on, metrics per-volume
+// on). A malformed or non-positive duration is a hard config error.
+func (c *Config) ResolveStats() (stats.Config, error) {
+	out := stats.Config{
+		Enabled:           true,
+		Interval:          stats.DefaultInterval,
+		StatfsTimeout:     stats.DefaultStatfsTimeout,
+		WalkEnabled:       true,
+		WalkInterval:      stats.DefaultWalkInterval,
+		WalkWorkers:       stats.DefaultWalkWorkers,
+		WalkBuffer:        stats.DefaultWalkBuffer,
+		WalkTimeout:       stats.DefaultWalkTimeout,
+		StaleAfter:        stats.DefaultStaleAfter,
+		MaxFailureBackoff: stats.DefaultMaxFailureBackoff,
+		AggregateInterval: stats.DefaultAggregateInterval,
+		MetricsPerVolume:  true,
+		QueryAddr:         stats.DefaultQueryAddr,
+		QueryTokenHeader:  stats.DefaultQueryTokenHeader,
+		Namespace:         stats.DefaultNamespace,
+	}
+	if c == nil || c.Stats == nil {
+		return out, nil
+	}
+	s := c.Stats
+
+	dur := func(name, v string, dst *time.Duration) error {
+		if v = strings.TrimSpace(v); v == "" {
+			return nil
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("config: stats.%s %q: %w", name, v, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("config: stats.%s must be > 0, got %q", name, v)
+		}
+		*dst = d
+		return nil
+	}
+	for _, f := range []struct {
+		name string
+		val  string
+		dst  *time.Duration
+	}{
+		{"interval", s.Interval, &out.Interval},
+		{"statfs_timeout", s.StatfsTimeout, &out.StatfsTimeout},
+		{"walk_interval", s.WalkInterval, &out.WalkInterval},
+		{"walk_timeout", s.WalkTimeout, &out.WalkTimeout},
+		{"stale_after", s.StaleAfter, &out.StaleAfter},
+		{"max_failure_backoff", s.MaxFailureBackoff, &out.MaxFailureBackoff},
+		{"aggregate_interval", s.AggregateInterval, &out.AggregateInterval},
+	} {
+		if err := dur(f.name, f.val, f.dst); err != nil {
+			return stats.Config{}, err
+		}
+	}
+
+	if s.Enabled != nil {
+		out.Enabled = *s.Enabled
+	}
+	if s.WalkEnabled != nil {
+		out.WalkEnabled = *s.WalkEnabled
+	}
+	if s.MetricsPerVolume != nil {
+		out.MetricsPerVolume = *s.MetricsPerVolume
+	}
+	if s.WalkWorkers > 0 {
+		out.WalkWorkers = s.WalkWorkers
+	}
+	if s.WalkBuffer > 0 {
+		out.WalkBuffer = s.WalkBuffer
+	}
+	if s.QueryAddr != nil { // explicit "" disables the endpoint
+		out.QueryAddr = *s.QueryAddr
+	}
+	out.QueryToken = s.QueryToken
+	if s.Namespace != "" {
+		out.Namespace = s.Namespace
+	}
+	if s.QueryTokenHeader != "" {
+		out.QueryTokenHeader = s.QueryTokenHeader
+	}
+	return out, nil
 }
 
 // Load reads and decodes the config at path. An empty path yields a zero Config

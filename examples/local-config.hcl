@@ -22,15 +22,14 @@ local {
   forward_addr   = ":9602"
   forward_secret = "REDACTED-shared-secret"
 
-  # Peer discovery. By default the driver discovers peers via Nomad's own
-  # /v1/nodes API over the task API socket (api.sock) — no external service.
-  # This requires an `identity` block on the plugin task (see the jobspec) and,
-  # with ACLs enabled, a node:read policy bound to it. It covers single- AND
-  # multi-node clusters; for a lone node every op resolves to self.
-  #
-  # (a) Nomad discovery (default). The block is OPTIONAL — omit it to use all
-  #     defaults (api.sock + nomad_token from NOMAD_SECRETS_DIR, scoped to
-  #     $NOMAD_DC, 5m cache). Shown here with the defaults made explicit:
+  # Peer discovery is via Nomad's own /v1/nodes API over the task API socket
+  # (api.sock) — no external service, and the ONLY mechanism (no static peer
+  # table). It requires an `identity` block on the plugin task (see the jobspec)
+  # and, with ACLs enabled, a `node:read` policy (plus `csi-read-volume` for the
+  # stats query API). It covers single- AND multi-node clusters; for a lone node
+  # every op resolves to self. The block is OPTIONAL — omit it for all defaults
+  # (api.sock + nomad_token from NOMAD_SECRETS_DIR, scoped to $NOMAD_DC, 5m
+  # cache). Shown here with the defaults made explicit:
   nomad {
     # socket_path = "${NOMAD_SECRETS_DIR}/api.sock"  # default
     # token_path  = "${NOMAD_SECRETS_DIR}/nomad_token" # default (re-read for rotation)
@@ -38,16 +37,27 @@ local {
     # node_filter = "NodeClass == \"storage\""  # only if the plugin job is constrained
     cache_ttl = "5m"
   }
-  #
-  # (b) A static peer table — the opt-in override (hard-coded addresses, or
-  #     running outside Nomad). When present it takes precedence; ship the same
-  #     table to every node:
-  #
-  #   peer "node1" { addr = "10.0.0.1:9602" }
-  #   peer "node2" { addr = "10.0.0.2:9602" }
 }
 
 metrics {
   enabled = true
   address = ":9503"
+}
+
+# Per-volume usage stats. The driver measures each staged volume's bytes/inodes
+# (statfs) and file/dir/other counts (a background tree walk), serving them on an
+# HTTP+JSON query API (GET /v1/volume-stats[/{nomad-volume-id}]) and as
+# nomad_csi_volume_* Prometheus gauges. ON by default — this whole block is
+# optional; the production defaults shown as comments apply when omitted.
+stats {
+  # enabled            = true    # master toggle (default on)
+  # query_addr         = ":9610" # query API listener; "" disables it
+  # query_token        = ""      # require this token (header X-NCD-Query-Token);
+  #                              # EMPTY/unset leaves the endpoint OPEN (no auth)
+  # query_token_header = "X-NCD-Query-Token"
+  # interval           = "60s"   # statfs cadence (cheap)
+  # walk_interval      = "5m"    # file/dir walk cadence (expensive)
+  # walk_workers       = 4       # shared walk pool size (the IO ceiling)
+  # walk_timeout       = "10m"   # per-volume walk deadline
+  # metrics_per_volume = true    # per-volume gauges; false = aggregate-only
 }

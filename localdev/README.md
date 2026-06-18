@@ -24,10 +24,11 @@ volumes/allocs, and cleans up.
   `LOCAL_INTEGRATION_POOL2=""`. The plugin image's ZFS userland must match each node's kernel
   module version (see `../Dockerfile`; `debian:12` → zfs 2.1.x).
 - **Workload identity** usable by the plugin task (the jobspec's `identity`
-  block surfaces the token it uses to read Nomad's `/v1/nodes` over `api.sock`
-  for peer discovery). With Nomad **ACLs enabled**, bind a `node:read` policy to
-  the `nomad-csi-driver-local` job/`plugin` task (see the jobspec header); with
-  ACLs off, no policy is needed. No Consul required.
+  block surfaces the token it uses to read Nomad's `/v1/nodes` for peer discovery
+  and `/v1/volumes` for the stats query API's id resolution, over `api.sock`).
+  With Nomad **ACLs enabled**, bind a policy granting `node:read` **and**
+  `csi-read-volume` (in the volumes' namespace) to the plugin task; with ACLs
+  off, no policy is needed. No Consul required.
 - The **plugin image** must be pullable by the cluster — build and push it via
   Packer:
   ```sh

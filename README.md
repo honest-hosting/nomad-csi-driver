@@ -76,7 +76,12 @@ nomad-csi-driver run \
 - `local`: `monolith` on every node under one `plugin_id`; controllers forward
   create/delete/expand/snapshot to the owning node (peer discovery via Nomad's
   `/v1/nodes` API over the task API socket — the plugin task needs an `identity`
-  block, plus a `node:read` policy when ACLs are enabled).
+  block, plus, when ACLs are enabled, `node:read` and — for the stats query API's
+  Nomad-id resolution — `csi-read-volume` in the queried namespace).
+
+**Workload-identity discovery is mandatory** — there is no static peer table.
+A deployment without an `identity` block / reachable `api.sock` fails fast at
+startup so Nomad reschedules it.
 
 ### `--parent-dataset` (`--driver=local`)
 
@@ -145,6 +150,7 @@ nomad job run    examples/local-monolith.nomad.hcl   # plugin on every node
 nomad volume create examples/local-volume.hcl        # provision the zvol
 nomad job run    examples/local-consumer.nomad.hcl   # mount it, stay up
 nomad alloc exec -job local-consumer df -h /data     # verify the mount
+curl -s localhost:9610/v1/volume-stats/local-data | jq  # per-volume usage by Nomad id
 ```
 
 **QNAP (iSCSI SAN) end-to-end:**
@@ -155,6 +161,7 @@ nomad job run    examples/qnap-node.nomad.hcl         # node plugin, every node
 nomad volume create examples/qnap-volume.hcl          # provision the LUN
 nomad job run    examples/qnap-consumer.nomad.hcl     # mount it, stay up
 nomad alloc exec -job qnap-consumer df -h /data       # verify the mount
+curl -s <controller-host>:9611/v1/volume-stats/qnap-data | jq  # per-volume usage by Nomad id
 ```
 
 Tear down in reverse — stop the consumer first so the CSI claim releases, then
@@ -281,6 +288,136 @@ skips cleanly when no qnap appliance is deployed.
 
 > Not yet emitted (planned, lower priority): qnap controller cache LUN count / age
 > and live iSCSI session count (qnap node).
+
+## Per-volume usage stats
+
+A backend-agnostic subsystem reports **per-volume** filesystem usage — total /
+used / free **bytes**, **inode** counts, and **file / directory / other** object
+counts — for every volume a node currently has staged. It works the same for
+both `--driver=local` and `--driver=qnap`, is **on by default**, and is exposed
+two ways: a synchronous **HTTP+JSON query API** and **Prometheus gauges**.
+
+**How it works.** Each node runs one lightweight background worker per staged
+volume: a cheap `statfs` on a fast cadence (bytes + inodes) and a concurrent
+directory walk on a slower cadence (file/dir/other counts). Readings are cached
+in memory. The **controller** answers queries and emits `/metrics` from that
+data:
+
+- **local** — the owning node is embedded in the volume ID, so a query forwards
+  to that node over the existing `:9602` forwarding transport. Each monolith
+  exposes its own node's volumes on `/metrics`.
+- **qnap** — the controller periodically **fans out** to all node daemons (same
+  forwarding transport), aggregates, and serves queries + a single central
+  `/metrics`. This requires `qnap.forward_secret` on the controller and node
+  (and a cluster-uniform node `forward_addr` — driver default `:9602`, which the
+  examples set to `:9612` so it doesn't clash with a co-located local monolith's
+  `:9602`); without `forward_secret`, qnap volumes still hydrate node-locally but
+  are not centrally queryable.
+
+**Resilience.** The subsystem degrades to *stale data* and never blocks the CSI
+RPC path: queries serve cached values, a hung `statfs`/`readdir` is abandoned by
+a watchdog (single-flight bounds leaked goroutines), repeated failures back off
+and self-heal, and staleness is observable via `*_age_seconds` / `stale` gauges.
+
+**Config** (`stats {}`; all fields optional, shown with defaults):
+
+```hcl
+stats {
+  enabled               = true               # master toggle (default ON)
+  interval              = "60s"              # statfs cadence
+  statfs_timeout        = "30s"              # hung-mount watchdog
+  walk_enabled          = true               # file/dir counting (default ON)
+  walk_interval         = "5m"               # tree-walk cadence
+  walk_workers          = 4                  # shared walk pool size (the IO ceiling)
+  walk_buffer           = 4096               # shared pending-directory backlog
+  walk_timeout          = "10m"              # per-volume walk deadline
+  stale_after           = "5m"               # reading considered stale beyond this
+  max_failure_backoff   = "30m"              # backoff cap after repeated errors
+
+  metrics_per_volume    = true               # per-volume gauges (vs aggregate-only)
+  query_addr            = ":9610"            # query API listener ("" disables)
+  query_token           = ""                 # bearer token; "" / unset = OPEN (no auth)
+  query_token_header    = "X-NCD-Query-Token"
+
+  aggregate_interval    = "60s"              # qnap only: controller fan-out cadence
+}
+```
+
+**Query API.** Served by the **controller role** on `query_addr` (local monolith
+default `:9610`; the qnap controller uses `:9611` in the examples). All endpoints
+are **`GET`** and return `application/json`.
+
+| Method & path | Success | Other statuses |
+| --- | --- | --- |
+| `GET /v1/volume-stats[?namespace=default]` | `200` — JSON array | `401` (bad/missing token), `502` (Nomad/upstream error) |
+| `GET /v1/volume-stats/{id}[?namespace=default]` | `200` — one record | `404` (id unknown to Nomad), `412` (known but **not mounted** on any node — created-but-unmounted, or workload stopped; body explains), `503` (mounted, not measured yet — partial record with a zero `statfs_at`), `401`, `502` |
+
+> **`{id}` is the Nomad volume id you manage** (e.g. `local-data` — what you set
+> in the volume spec and see in `nomad volume status`). The driver's internal
+> external id is never exposed: the controller resolves the Nomad id → external id
+> via Nomad's API (cached). `namespace` defaults to `default` (no wildcard /
+> multi-namespace in v1).
+>
+> ```sh
+> curl -s localhost:9610/v1/volume-stats/local-data | jq
+> ```
+>
+> For **local**, a by-id lookup may hit *any* monolith — it resolves the id then
+> forwards to the owning node. The **list** endpoint returns only the queried
+> node's volumes (scrape every node, or rely on the aggregated metrics). For
+> **qnap**, both endpoints serve the controller's cluster-wide aggregate.
+
+**Response body:** byte/inode fields come from `statfs`; `*_count` from the tree
+walk. Timestamps are RFC3339; `walk_duration` is **nanoseconds** (Go
+`time.Duration`). On a `503` (not yet measured) the numeric fields are zero and
+`statfs_at`/`walk_at` are the zero time.
+
+```jsonc
+{
+  "id":              "local-data",   // the Nomad volume id (no external id exposed)
+  "namespace":       "default",
+  "node":            "node1",        // owning/mounting node
+  "access_type":     "mount",        // "mount" | "block" (block omits fs/inode/walk data)
+  "total_bytes":     1063256064,
+  "used_bytes":      2125824,
+  "available_bytes": 1007550464,
+  "total_inodes":    65536,
+  "used_inodes":     11,
+  "free_inodes":     65525,
+  "statfs_at":       "2026-06-18T17:04:12Z",  // last successful statfs
+  "file_count":      0,
+  "dir_count":       1,              // a fresh ext4 fs has lost+found
+  "other_count":     0,             // symlinks/sockets/devices/pipes
+  "walk_at":         "2026-06-18T17:04:15Z",  // last completed walk
+  "walk_duration":   3500000,       // ns
+  "walk_complete":   true,          // false until the first full walk
+  "last_error":      ""             // most recent statfs/walk error ("" = healthy); omitted when empty
+}
+```
+
+**Auth** is an opt-in bearer token: set `query_token` and clients must send it in
+`query_token_header` (default `X-NCD-Query-Token`), e.g.
+`curl -H "X-NCD-Query-Token: $TOKEN" …`. **An empty/unset token leaves the
+endpoint OPEN** to anyone who can reach `query_addr` — an explicit, supported
+choice. The token is distinct from the forwarding `forward_secret` (different
+trust domain). Like the forwarding transport, traffic is cleartext on a trusted
+L2 (mTLS deferred).
+
+**Metrics** (controller role; `metrics_per_volume = false` collapses to the
+aggregate gauges):
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `nomad_csi_volume_total_bytes` / `_used_bytes` / `_available_bytes` (gauges) | `id,namespace,node` | Filesystem size / used / available |
+| `nomad_csi_volume_inodes_total` / `_inodes_used` / `_inodes_free` (gauges) | `id,namespace,node` | Inode usage |
+| `nomad_csi_volume_files` / `_dirs` / `_other` (gauges) | `id,namespace,node` | Object counts from the tree walk |
+| `nomad_csi_volume_statfs_age_seconds` / `_walk_age_seconds` / `_walk_duration_seconds` (gauges) | `id,namespace,node` | Freshness + last walk duration |
+| `nomad_csi_volume_stale` (gauge) | `id,namespace,node` | 1 if older than `stale_after` |
+| `nomad_csi_volume_count` / `_used_bytes_sum` / `_total_bytes_sum` (gauges) | — | Aggregate (emitted when `metrics_per_volume = false`) |
+
+> Per-volume labels are a deliberate, documented exception to the driver's
+> otherwise no-per-volume-cardinality rule (bounded by volume count). Set
+> `metrics_per_volume = false` if cardinality is a concern.
 
 ## Development
 

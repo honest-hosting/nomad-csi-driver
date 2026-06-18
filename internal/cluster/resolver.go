@@ -29,8 +29,10 @@ type Resolver interface {
 	Resolve(ctx context.Context, node string) (string, error)
 }
 
-// StaticResolver is a fixed peer table — used as the opt-in discovery override
-// (hard-coded addresses / running outside Nomad) and in tests.
+// StaticResolver is a fixed peer table implementing Resolver. It is a
+// test/dependency-injection fixture only — production peer discovery is always
+// Nomad workload-identity discovery (NomadResolver); there is no operator-facing
+// static peer table.
 type StaticResolver struct {
 	Self  string
 	Peers []NodeInfo
