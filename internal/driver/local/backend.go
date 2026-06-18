@@ -24,6 +24,7 @@ import (
 	"github.com/honest-hosting/nomad-csi-driver/internal/driver"
 	"github.com/honest-hosting/nomad-csi-driver/internal/metrics"
 	"github.com/honest-hosting/nomad-csi-driver/internal/mountutil"
+	"github.com/honest-hosting/nomad-csi-driver/internal/stats"
 	"github.com/honest-hosting/nomad-csi-driver/internal/zfs"
 )
 
@@ -52,6 +53,8 @@ type backend struct {
 	z          *zfs.ZFS
 	cfg        *config.LocalConfig
 	forwardSrv *http.Server
+	statsReg   *stats.Registry
+	queryS     *stats.QueryServer
 	log        *zap.Logger
 }
 
@@ -81,7 +84,15 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 		forwardAddr = defaultForwardAddr
 	}
 
-	res, err := buildResolver(cfg, d.NodeID, forwardAddr, log)
+	nopts, err := nomadOptions(cfg, d.NodeID, forwardAddr, log)
+	if err != nil {
+		return nil, err
+	}
+	res, err := cluster.NewNomadResolver(nopts)
+	if err != nil {
+		return nil, err
+	}
+	mapper, err := cluster.NewNomadVolumes(nopts) // Nomad-id ↔ external-id for the stats API
 	if err != nil {
 		return nil, err
 	}
@@ -104,6 +115,15 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 		reg.MustRegister(newPoolCollector(z, cfg, parentDataset, log)) // pool gauges, computed on scrape
 	}
 	nm := nodeMetrics(d) // shared node metrics (mount + staged), also the mounter's sink
+
+	statsCfg, err := d.Config.ResolveStats()
+	if err != nil {
+		return nil, err
+	}
+	statsReg := stats.NewRegistry(statsCfg, d.NodeID, log)
+	ctrl.statsReg = statsReg
+	ctrl.mapper = mapper
+	ctrl.statsNS = statsCfg.Namespace
 
 	b := &backend{
 		caps: driver.Capabilities{
@@ -128,11 +148,13 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 			mounter:     mountutil.New(d.Runner, log).WithMetrics(nm),
 			log:         log,
 			nodeM:       nm,
+			stats:       statsReg,
 			waitForPath: osWaitForPath(devAppearTimeout),
 		},
-		z:   z,
-		cfg: cfg,
-		log: log,
+		z:        z,
+		cfg:      cfg,
+		statsReg: statsReg,
+		log:      log,
 	}
 
 	// Start the forwarding server so peers can route owner-node operations here.
@@ -147,6 +169,27 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 			log.Error("forwarding server error", zap.Error(err))
 		}
 	}()
+
+	// Stats query API + per-volume usage metrics. Every local monolith is a
+	// controller, so each exposes its own node's volumes (Prometheus aggregates
+	// across node scrapes; cross-node queries forward to the owner).
+	if statsCfg.Enabled {
+		if d.Metrics != nil {
+			if err := stats.RegisterCollector(d.Metrics.Registry(), ctrl.metricsSnapshot, statsCfg.MetricsPerVolume, statsCfg.StaleAfter); err != nil {
+				return nil, driver.Internal("registering stats collector: %v", err)
+			}
+		}
+		qs, err := stats.NewQueryServer(statsCfg.QueryAddr, ctrl, statsCfg.QueryToken, statsCfg.QueryTokenHeader, log)
+		if err != nil {
+			return nil, driver.Internal("starting stats query server: %v", err)
+		}
+		if qs != nil {
+			qs.Serve()
+			b.queryS = qs
+			log.Info("stats query API listening", zap.String("address", qs.Addr()),
+				zap.Bool("auth", statsCfg.QueryToken != ""))
+		}
+	}
 
 	// Log the discovered peer count once at startup (best-effort; non-fatal).
 	// Discovery is read-only — nothing to register — so there is no background
@@ -167,6 +210,10 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 // Shutdown stops the forwarding server. Peer discovery is read-only (nothing
 // was registered), so there is nothing to deregister.
 func (b *backend) Shutdown(ctx context.Context) error {
+	b.statsReg.Close() // stop per-volume stat workers + walk pool (non-blocking)
+	if b.queryS != nil {
+		_ = b.queryS.Close(ctx)
+	}
 	if b.forwardSrv != nil {
 		return b.forwardSrv.Shutdown(ctx)
 	}
@@ -227,36 +274,13 @@ func validatePools(cfg *config.LocalConfig) error {
 	return nil
 }
 
-// buildResolver picks the peer-discovery strategy: an explicit static peer
-// table is the opt-in override; otherwise discovery runs through Nomad's
-// /v1/nodes API over the task API socket. There is no single-node fallback
-// (Nomad discovery covers N=1) and no Consul. A NomadResolver that cannot reach
-// the task API (no socket / no token source) returns an error, so New exits
-// non-zero and Nomad reschedules with a corrected identity block.
-func buildResolver(cfg *config.LocalConfig, nodeID, forwardAddr string, log *zap.Logger) (cluster.Resolver, error) {
-	if len(cfg.Peers) > 0 {
-		peers := make([]cluster.NodeInfo, 0, len(cfg.Peers))
-		selfPresent := false
-		for _, p := range cfg.Peers {
-			peers = append(peers, cluster.NodeInfo{Node: p.Node, Addr: p.Addr})
-			if p.Node == nodeID {
-				selfPresent = true
-			}
-		}
-		// Fail fast: if this node isn't in its own static peer table, every
-		// "owned by me" comparison misses and the node silently owns nothing,
-		// forwarding operations meant for itself. Catch the misconfiguration at
-		// startup instead.
-		if !selfPresent {
-			names := make([]string, 0, len(cfg.Peers))
-			for _, p := range cfg.Peers {
-				names = append(names, p.Node)
-			}
-			return nil, driver.InvalidArgument("--node-id %q is not present in the static peer table (peers: %v); each node's own id must appear in its peer list", nodeID, names)
-		}
-		return &cluster.StaticResolver{Self: nodeID, Peers: peers}, nil
-	}
-
+// nomadOptions builds the shared Nomad task-API options used for BOTH peer
+// discovery (NomadResolver) and volume-id resolution (NomadVolumes). Discovery
+// over the task API + workload identity is the only peer-discovery mechanism —
+// there is no static peer table and no Consul; a NomadResolver that cannot reach
+// the task API (no socket / no token) returns an error, so New exits non-zero and
+// Nomad reschedules with a corrected identity block.
+func nomadOptions(cfg *config.LocalConfig, nodeID, forwardAddr string, log *zap.Logger) (cluster.NomadOptions, error) {
 	nc := cfg.Nomad
 	if nc == nil {
 		nc = &config.NomadConfig{}
@@ -265,12 +289,12 @@ func buildResolver(cfg *config.LocalConfig, nodeID, forwardAddr string, log *zap
 	if s := strings.TrimSpace(nc.CacheTTL); s != "" {
 		d, err := time.ParseDuration(s)
 		if err != nil {
-			return nil, driver.InvalidArgument("local.nomad.cache_ttl %q: %v", s, err)
+			return cluster.NomadOptions{}, driver.InvalidArgument("local.nomad.cache_ttl %q: %v", s, err)
 		}
 		ttl = d
 	}
 	secretsDir := os.Getenv("NOMAD_SECRETS_DIR")
-	return cluster.NewNomadResolver(cluster.NomadOptions{
+	return cluster.NomadOptions{
 		Self:        nodeID,
 		SocketPath:  orDefaultPath(nc.SocketPath, secretsDir, "api.sock"),
 		TokenPath:   orDefaultPath(nc.TokenPath, secretsDir, "nomad_token"),
@@ -280,7 +304,7 @@ func buildResolver(cfg *config.LocalConfig, nodeID, forwardAddr string, log *zap
 		ForwardPort: portOf(forwardAddr),
 		CacheTTL:    ttl,
 		Logger:      log,
-	})
+	}, nil
 }
 
 // orDefaultPath returns override if set, else dir/name when dir is non-empty,

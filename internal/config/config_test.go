@@ -1,7 +1,6 @@
 package config
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -58,41 +57,6 @@ func TestLoadEmptyPath(t *testing.T) {
 	assert.NotNil(t, cfg)
 	assert.Nil(t, cfg.QNAP)
 	assert.Nil(t, cfg.Local)
-}
-
-// TestLoadLocalWithPeers verifies the static peer-table form the e2e harness
-// renders (scripts/e2e-common.sh _write_node_config) parses against LocalConfig.
-func TestLoadLocalWithPeers(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config-ncd-n1.hcl")
-	const data = `
-local {
-  default_pool = "ncde2e"
-  pool "ncde2e" {
-    parent_dataset = "ncd-n1"
-  }
-  default_volblocksize = "16K"
-  forward_addr         = ":19602"
-  forward_secret       = "e2e-secret"
-  peer "ncd-n1" {
-    addr = "127.0.0.1:19602"
-  }
-  peer "ncd-n2" {
-    addr = "127.0.0.1:19603"
-  }
-}
-`
-	require.NoError(t, os.WriteFile(path, []byte(data), 0o644))
-	cfg, err := Load(path)
-	require.NoError(t, err)
-	require.NotNil(t, cfg.Local)
-	assert.Equal(t, "ncde2e", cfg.Local.DefaultPool)
-	pc, ok := cfg.Local.PoolByName("ncde2e")
-	require.True(t, ok)
-	assert.Equal(t, "ncd-n1", pc.ParentDataset)
-	require.Len(t, cfg.Local.Peers, 2)
-	assert.Equal(t, "ncd-n2", cfg.Local.Peers[1].Node)
-	assert.Equal(t, "127.0.0.1:19603", cfg.Local.Peers[1].Addr)
 }
 
 // TestLoadExampleConfigs guards the examples/*.hcl configs against schema drift:

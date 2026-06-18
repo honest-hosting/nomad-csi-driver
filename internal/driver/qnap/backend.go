@@ -14,12 +14,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
+	"github.com/honest-hosting/nomad-csi-driver/internal/cluster"
 	"github.com/honest-hosting/nomad-csi-driver/internal/config"
 	"github.com/honest-hosting/nomad-csi-driver/internal/driver"
 	"github.com/honest-hosting/nomad-csi-driver/internal/iscsi"
 	"github.com/honest-hosting/nomad-csi-driver/internal/metrics"
 	"github.com/honest-hosting/nomad-csi-driver/internal/mountutil"
 	"github.com/honest-hosting/nomad-csi-driver/internal/multipath"
+	"github.com/honest-hosting/nomad-csi-driver/internal/stats"
 )
 
 // nodeMetrics builds the shared node mount-layer metrics, or nil when metrics
@@ -35,17 +37,22 @@ func nodeMetrics(d driver.Deps) *metrics.NodeMetrics {
 func init() { driver.Register("qnap", New) }
 
 const (
-	pluginName       = "io.honesthosting.csi.qnap"
-	defaultStateDir  = "/var/lib/nomad-csi-driver/qnap"
-	devAppearTimeout = 60 * time.Second
+	pluginName         = "io.honesthosting.csi.qnap"
+	defaultStateDir    = "/var/lib/nomad-csi-driver/qnap"
+	devAppearTimeout   = 60 * time.Second
+	defaultForwardAddr = ":9602"
 )
 
 // backend implements driver.Backend for the qnap SAN backend.
 type backend struct {
-	caps driver.Capabilities
-	ctrl *controller
-	nd   *node
-	log  *zap.Logger
+	caps       driver.Capabilities
+	ctrl       *controller
+	nd         *node
+	statsReg   *stats.Registry    // node-side per-volume usage stats; nil for controller-only
+	forwardSrv *http.Server       // node-side stats forwarding server
+	source     *qnapSource        // controller-side fan-out aggregate
+	queryS     *stats.QueryServer // controller-side public query API
+	log        *zap.Logger
 }
 
 // New constructs the qnap backend for the given mode.
@@ -57,6 +64,10 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 	log := d.Logger
 	if log == nil {
 		log = zap.NewNop()
+	}
+	statsCfg, err := d.Config.ResolveStats()
+	if err != nil {
+		return nil, err
 	}
 
 	b := &backend{
@@ -105,6 +116,7 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 			qnm = newQNAPNodeMetrics(d.Metrics.Registry())
 		}
 		nm := nodeMetrics(d)
+		b.statsReg = stats.NewRegistry(statsCfg, d.NodeID, log)
 		b.nd = &node{
 			cfg:          cfg,
 			nodeID:       d.NodeID,
@@ -116,18 +128,107 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 			log:          log,
 			metrics:      qnm,
 			nodeM:        nm,
+			stats:        b.statsReg,
 			waitForPath:  osWaitForPath(devAppearTimeout),
 		}
 		if b.nd.useMultipath {
 			b.installMultipathDropin(context.Background(), mpath)
 		}
 	}
+
+	if err := b.setupStats(d, cfg, statsCfg, log); err != nil {
+		return nil, err
+	}
 	return b, nil
+}
+
+// setupStats wires the per-volume usage stats transport. The node runs a
+// forwarding server (so the controller can pull its readings); the controller
+// fans out to all nodes, aggregates, and exposes the query API + /metrics. Both
+// require a shared forward_secret — without it, qnap stats hydrate node-locally
+// but are not centrally queryable.
+func (b *backend) setupStats(d driver.Deps, cfg *config.QNAPConfig, statsCfg stats.Config, log *zap.Logger) error {
+	if !statsCfg.Enabled {
+		return nil
+	}
+	if cfg.ForwardSecret == "" {
+		if d.Mode.HasController() {
+			log.Warn("qnap stats: forward_secret not set; central query API and /metrics disabled (node-local hydration still runs)")
+		}
+		return nil
+	}
+	forwardAddr := cfg.ForwardAddr
+	if forwardAddr == "" {
+		forwardAddr = defaultForwardAddr
+	}
+
+	// Node: serve its readings to the controller.
+	if b.nd != nil {
+		b.forwardSrv = &http.Server{
+			Addr:              forwardAddr,
+			Handler:           cluster.NewServer(cfg.ForwardSecret, b.nd.dispatchForward),
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		go func() {
+			log.Info("qnap stats forwarding server listening", zap.String("address", forwardAddr))
+			if err := b.forwardSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Error("qnap stats forwarding server error", zap.Error(err))
+			}
+		}()
+	}
+
+	// Controller: fan out to nodes, aggregate, and expose query API + metrics.
+	if d.Mode.HasController() {
+		nopts, err := nomadOptions(cfg, d.NodeID, forwardAddr, log)
+		if err != nil {
+			return err
+		}
+		res, err := cluster.NewNomadResolver(nopts)
+		if err != nil {
+			return err
+		}
+		mapper, err := cluster.NewNomadVolumes(nopts) // Nomad-id ↔ external-id for the stats API
+		if err != nil {
+			return err
+		}
+		b.source = newQNAPSource(res, cluster.NewClient(cfg.ForwardSecret), mapper, statsCfg.Namespace, statsCfg.AggregateInterval, log)
+		if d.Metrics != nil {
+			if err := stats.RegisterCollector(d.Metrics.Registry(), b.source.metricsSnapshot, statsCfg.MetricsPerVolume, statsCfg.StaleAfter); err != nil {
+				return driver.Internal("registering stats collector: %v", err)
+			}
+		}
+		qs, err := stats.NewQueryServer(statsCfg.QueryAddr, b.source, statsCfg.QueryToken, statsCfg.QueryTokenHeader, log)
+		if err != nil {
+			return driver.Internal("starting stats query server: %v", err)
+		}
+		if qs != nil {
+			qs.Serve()
+			b.queryS = qs
+			log.Info("stats query API listening", zap.String("address", qs.Addr()), zap.Bool("auth", statsCfg.QueryToken != ""))
+		}
+	}
+	return nil
 }
 
 func (b *backend) Name() string                      { return "qnap" }
 func (b *backend) PluginName() string                { return pluginName }
 func (b *backend) Capabilities() driver.Capabilities { return b.caps }
+
+// Shutdown stops the stats subsystem: node-side workers/walk pool + forwarding
+// server, and controller-side fan-out collector + query server. All are
+// non-blocking and nil-safe (controller-only / node-only processes skip the
+// halves they never built).
+func (b *backend) Shutdown(ctx context.Context) error {
+	b.statsReg.Close()
+	b.source.Close()
+	if b.queryS != nil {
+		_ = b.queryS.Close(ctx)
+	}
+	if b.forwardSrv != nil {
+		return b.forwardSrv.Shutdown(ctx)
+	}
+	return nil
+}
 
 func (b *backend) Controller() driver.ControllerBackend {
 	if b.ctrl == nil {

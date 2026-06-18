@@ -11,6 +11,7 @@ import (
 	"github.com/honest-hosting/nomad-csi-driver/internal/driver"
 	"github.com/honest-hosting/nomad-csi-driver/internal/metrics"
 	"github.com/honest-hosting/nomad-csi-driver/internal/mountutil"
+	"github.com/honest-hosting/nomad-csi-driver/internal/stats"
 	"github.com/honest-hosting/nomad-csi-driver/internal/zfs"
 )
 
@@ -24,6 +25,7 @@ type node struct {
 	mounter *mountutil.Mounter
 	log     *zap.Logger
 	nodeM   *metrics.NodeMetrics // shared node metrics (staged count); nil-safe
+	stats   *stats.Registry      // per-volume usage stats; nil-safe no-op when disabled
 
 	// waitForPath polls until the device path exists; overridable in tests.
 	waitForPath func(ctx context.Context, path string) (string, error)
@@ -33,6 +35,7 @@ func (n *node) StageVolume(ctx context.Context, req *driver.StageRequest) (err e
 	defer func() {
 		if err == nil {
 			n.nodeM.StagedInc()
+			n.stats.Track(req.VolumeID, req.StagingTargetPath, stageAccessType(req.VolumeCapability.AccessType))
 		}
 	}()
 	// Wrong-node guard (data safety): a stage that lands on a non-owner node must
@@ -84,7 +87,16 @@ func (n *node) UnstageVolume(ctx context.Context, req *driver.UnstageRequest) er
 		return driver.Internal("unmount staging: %v", err)
 	}
 	n.nodeM.StagedDec()
+	n.stats.Untrack(req.VolumeID)
 	return nil
+}
+
+// stageAccessType maps the CSI access type to the stats access-type label.
+func stageAccessType(at driver.AccessType) string {
+	if at == driver.AccessTypeBlock {
+		return stats.AccessBlock
+	}
+	return stats.AccessMount
 }
 
 func (n *node) PublishVolume(ctx context.Context, req *driver.PublishRequest) error {

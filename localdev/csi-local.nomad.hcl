@@ -70,11 +70,15 @@ job "nomad-csi-driver-local" {
 
       # Peer discovery reads Nomad's /v1/nodes over the task API socket; this
       # surfaces the workload-identity token (file is re-read for rotation, env
-      # is the fallback). With Nomad ACLs ENABLED, also bind a node:read policy
-      # to this workload (ACLs off => no policy needed):
-      #   echo 'node { policy = "read" }' > resolver.policy.hcl
+      # is the fallback). It reads /v1/nodes (discovery) + /v1/volumes (stats id
+      # resolution). With Nomad ACLs ENABLED, bind node:read + csi-read-volume
+      # (ACLs off => no policy needed):
+      #   cat > ncd.policy.hcl <<'EOF'
+      #   node { policy = "read" }
+      #   namespace "default" { capabilities = ["csi-read-volume"] }
+      #   EOF
       #   nomad acl policy apply -namespace default -job nomad-csi-driver-local \
-      #     -group plugin -task plugin csi-local-resolver resolver.policy.hcl
+      #     -group plugin -task plugin csi-local-ncd ncd.policy.hcl
       identity {
         env  = true
         file = true
@@ -134,6 +138,15 @@ metrics {
 %{ endif ~}
 readiness {
   timeout = "${var.readiness_timeout}"
+}
+# Per-volume usage stats. Defaults are production cadences (60s statfs / 5m walk);
+# they are shortened here so the e2e suite observes a walk within the test window.
+# query_addr defaults to :9610 (the klm API / test scrapes it).
+stats {
+  interval      = "5s"
+  walk_interval = "10s"
+  walk_timeout  = "2m"
+  stale_after   = "30s"
 }
 EOH
       }

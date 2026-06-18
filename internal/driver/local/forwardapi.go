@@ -7,6 +7,7 @@ import (
 
 	"github.com/honest-hosting/nomad-csi-driver/internal/cluster"
 	"github.com/honest-hosting/nomad-csi-driver/internal/driver"
+	"github.com/honest-hosting/nomad-csi-driver/internal/stats"
 )
 
 // Forward operation names (the method segment of the forward URL).
@@ -20,6 +21,8 @@ const (
 	mList           = "list"
 	mListSnapshots  = "listsnapshots"
 	mExists         = "exists"
+	mVolStats       = stats.MethodVolStats     // per-volume usage for one volume (by id)
+	mVolStatsDump   = stats.MethodVolStatsDump // all per-volume usage readings on this node
 )
 
 // Wire request/response types for forwarded operations. These cross node
@@ -178,6 +181,18 @@ func (c *controller) dispatchForward(ctx context.Context, method string, body []
 		}
 		res, err := c.localExists(ctx, a.ID)
 		return encodeOrCoded(res, err)
+	case mVolStats:
+		var a idArgs
+		if err := json.Unmarshal(body, &a); err != nil {
+			return nil, codedFromErr(driver.InvalidArgument("decoding volstats args: %v", err))
+		}
+		cs, ok := c.statsReg.Get(a.ID)
+		if !ok {
+			return nil, codedFromErr(driver.NotFound("volume %s not tracked on this node", a.ID))
+		}
+		return encodeOrCoded(cs, nil)
+	case mVolStatsDump:
+		return encodeOrCoded(c.statsReg.Dump(), nil)
 	default:
 		return nil, codedFromErr(driver.InvalidArgument("unknown forward method %q", method))
 	}

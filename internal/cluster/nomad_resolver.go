@@ -2,13 +2,9 @@ package cluster
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net"
-	"net/http"
 	"net/url"
-	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -30,14 +26,11 @@ const defaultCacheTTL = 5 * time.Minute
 // long-poll machinery.
 type NomadResolver struct {
 	self        string
-	socketPath  string
-	tokenPath   string
-	tokenLit    string
 	datacenter  string
 	nodeFilter  string
 	forwardPort int
 	ttl         time.Duration
-	http        *http.Client
+	h           *nomadHTTP
 	log         *zap.Logger
 
 	mu        sync.Mutex
@@ -75,37 +68,21 @@ func NewNomadResolver(opts NomadOptions) (*NomadResolver, error) {
 	if ttl <= 0 {
 		ttl = defaultCacheTTL
 	}
+	h, err := newNomadHTTP(opts.SocketPath, opts.TokenPath, opts.Token, log)
+	if err != nil {
+		return nil, err
+	}
 	r := &NomadResolver{
 		self:        opts.Self,
-		socketPath:  opts.SocketPath,
-		tokenPath:   opts.TokenPath,
-		tokenLit:    opts.Token,
 		datacenter:  opts.Datacenter,
 		nodeFilter:  opts.NodeFilter,
 		forwardPort: opts.ForwardPort,
 		ttl:         ttl,
+		h:           h,
 		log:         log,
 	}
-	if r.socketPath == "" {
-		return nil, fmt.Errorf("cluster: nomad discovery needs the task API socket " +
-			"(NOMAD_SECRETS_DIR/api.sock); is this running under Nomad with an identity block?")
-	}
-	if _, err := r.token(); err != nil {
-		return nil, fmt.Errorf("cluster: nomad discovery has no usable token "+
-			"(set an `identity { env = true, file = true }` block on the plugin task): %w", err)
-	}
-	socket := r.socketPath
-	r.http = &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, "unix", socket)
-			},
-		},
-	}
 	log.Debug("nomad: resolver configured",
-		zap.String("socket", r.socketPath), zap.String("datacenter", r.datacenter),
+		zap.String("socket", opts.SocketPath), zap.String("datacenter", r.datacenter),
 		zap.Int("forward_port", r.forwardPort), zap.Bool("node_filter", r.nodeFilter != ""),
 		zap.Duration("cache_ttl", r.ttl))
 	return r, nil
@@ -113,26 +90,6 @@ func NewNomadResolver(opts NomadOptions) (*NomadResolver, error) {
 
 // LocalNode returns this node's name.
 func (r *NomadResolver) LocalNode() string { return r.self }
-
-// token resolves the bearer token: the TokenPath file first (re-read each call
-// so workload-identity rotation is picked up), then the literal override, then
-// the NOMAD_TOKEN env. Returns an error if none yields a non-empty token.
-func (r *NomadResolver) token() (string, error) {
-	if r.tokenPath != "" {
-		if b, err := os.ReadFile(r.tokenPath); err == nil {
-			if tok := strings.TrimSpace(string(b)); tok != "" {
-				return tok, nil
-			}
-		}
-	}
-	if r.tokenLit != "" {
-		return r.tokenLit, nil
-	}
-	if tok := strings.TrimSpace(os.Getenv("NOMAD_TOKEN")); tok != "" {
-		return tok, nil
-	}
-	return "", fmt.Errorf("no token in file %q, literal, or $NOMAD_TOKEN", r.tokenPath)
-}
 
 // List returns the peer roster, served from cache when fresh; a stale cache is
 // refreshed, and a refresh error falls back to the last good roster.
@@ -196,31 +153,14 @@ type nodeStub struct {
 
 // refresh fetches the roster from /v1/nodes and replaces the cache on success.
 func (r *NomadResolver) refresh(ctx context.Context) ([]NodeInfo, error) {
-	tok, err := r.token()
-	if err != nil {
-		return nil, err
-	}
-	endpoint := "http://localhost/v1/nodes"
+	path := "/v1/nodes"
 	if r.nodeFilter != "" {
-		endpoint += "?filter=" + url.QueryEscape(r.nodeFilter)
+		path += "?filter=" + url.QueryEscape(r.nodeFilter)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+tok)
 	r.log.Debug("nomad: listing nodes", zap.String("datacenter", r.datacenter))
-	resp, err := r.http.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("cluster: querying nomad api.sock: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("cluster: nomad /v1/nodes returned %s", resp.Status)
-	}
 	var stubs []nodeStub
-	if err := json.NewDecoder(resp.Body).Decode(&stubs); err != nil {
-		return nil, fmt.Errorf("cluster: decoding /v1/nodes: %w", err)
+	if err := r.h.getJSON(ctx, path, &stubs); err != nil {
+		return nil, err
 	}
 
 	// Apply the well-supported filters client-side (the Address field on the

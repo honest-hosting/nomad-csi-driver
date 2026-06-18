@@ -76,6 +76,18 @@ variable "readiness_timeout" {
   description = "How long the controller retries the startup readiness probe (a live QNAP appliance session) before exiting non-zero so Nomad reschedules. \"0\" = single attempt (fail fast)."
 }
 
+variable "forward_secret" {
+  type        = string
+  default     = "e2e-secret-qnap"
+  description = "Shared secret for the per-volume stats forwarding transport. Must match the qnap node job. Enables the controller's stats fan-out + query API."
+}
+
+variable "discovery_cache_ttl" {
+  type        = string
+  default     = "30s"
+  description = "How long the node roster from Nomad's /v1/nodes is cached before refresh (controller stats fan-out). Short here for e2e responsiveness."
+}
+
 job "nomad-csi-driver-qnap-controller" {
   type = "service"
 
@@ -84,6 +96,22 @@ job "nomad-csi-driver-qnap-controller" {
 
     task "plugin" {
       driver = "docker"
+
+      # Peer discovery reads Nomad's /v1/nodes over the task API socket; this
+      # surfaces the workload-identity token (file is re-read for rotation, env
+      # is the fallback). It reads /v1/nodes (node fan-out) + /v1/volumes (stats id
+      # resolution). With Nomad ACLs ENABLED, bind node:read + csi-read-volume
+      # (ACLs off => no policy needed):
+      #   cat > ncd.policy.hcl <<'EOF'
+      #   node { policy = "read" }
+      #   namespace "default" { capabilities = ["csi-read-volume"] }
+      #   EOF
+      #   nomad acl policy apply -namespace default -job nomad-csi-driver-qnap-controller \
+      #     -group controller -task plugin csi-qnap-ncd ncd.policy.hcl
+      identity {
+        env  = true
+        file = true
+      }
 
       config {
         image        = var.image
@@ -111,6 +139,15 @@ qnap {
   default_pool_id = ${var.pool_id}
   interfaces      = ${jsonencode(split(",", var.interfaces))}
   debug_http      = ${var.debug_http}
+  # Per-volume stats fan-out: the controller pulls each node's readings over the
+  # forwarding transport. forward_addr is the cluster-uniform port nodes listen on
+  # (:9612); the controller dials it, it does not bind it. Node discovery uses
+  # Nomad's /v1/nodes over api.sock (same as the local backend).
+  forward_secret = "${var.forward_secret}"
+  forward_addr   = ":9612"
+  nomad {
+    cache_ttl = "${var.discovery_cache_ttl}"
+  }
 }
 %{ if var.metrics_enabled ~}
 metrics {
@@ -120,6 +157,16 @@ metrics {
 %{ endif ~}
 readiness {
   timeout = "${var.readiness_timeout}"
+}
+# Per-volume usage stats. query_addr :9611 avoids the local monolith's :9610 on a
+# co-located node; cadences shortened for the e2e suite.
+stats {
+  query_addr         = ":9611"
+  aggregate_interval = "5s"
+  interval           = "5s"
+  walk_interval      = "10s"
+  walk_timeout       = "2m"
+  stale_after        = "30s"
 }
 EOH
       }

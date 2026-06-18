@@ -26,9 +26,32 @@ qnap {
   # disable_multipath   = false # true = raw single device, skip dm-multipath
   # node_state_dir      = "/var/lib/nomad-csi-driver/qnap"
   # debug_http          = false # log raw QNAP requests/responses (verbose; needs --log-level=debug)
+
+  # Per-volume stats fan-out (optional). qnap volumes carry no owning-node in
+  # their ID, so the controller pulls each node's readings over a small
+  # forwarding transport and aggregates them. Set the SAME forward_secret on the
+  # node config; nodes listen on forward_addr, the controller dials it.
+  # Requires an `identity` block on the CONTROLLER task (Nomad /v1/nodes
+  # discovery over api.sock) — see qnap-controller.nomad.hcl. Omit forward_secret
+  # to leave central stats off (nodes still hydrate locally).
+  forward_secret = "REDACTED-shared-secret" # MUST match the node config
+  forward_addr   = ":9612"                  # cluster-uniform; :9612 ≠ local's :9602
+  # nomad {}  # discovery tuning; defaults to api.sock + $NOMAD_DC (see local-config.hcl)
 }
 
 metrics {
   enabled = true
   address = ":9501"
+}
+
+# Per-volume usage stats. On the CONTROLLER this serves the aggregated query API
+# + nomad_csi_volume_* gauges; :9611 keeps it off the local monolith's :9610 when
+# co-located. (On a NODE config, this block only tunes local hydration cadences.)
+stats {
+  query_addr = ":9611"
+  # query_token        = ""     # empty/unset = OPEN; set to require X-NCD-Query-Token
+  # aggregate_interval = "60s"  # how often the controller fans out to nodes
+  # interval           = "60s"  # statfs cadence
+  # walk_interval      = "5m"   # file/dir walk cadence
+  # metrics_per_volume = true   # per-volume gauges; false = aggregate-only
 }

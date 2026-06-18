@@ -13,6 +13,7 @@ import (
 	"github.com/honest-hosting/nomad-csi-driver/internal/cluster"
 	"github.com/honest-hosting/nomad-csi-driver/internal/config"
 	"github.com/honest-hosting/nomad-csi-driver/internal/driver"
+	"github.com/honest-hosting/nomad-csi-driver/internal/stats"
 	"github.com/honest-hosting/nomad-csi-driver/internal/zfs"
 )
 
@@ -30,6 +31,13 @@ type controller struct {
 	log           *zap.Logger
 	// metrics is optional (nil in tests / node-only); observeZFS is nil-safe.
 	metrics *localMetrics
+	// statsReg is the node-side per-volume usage cache (nil-safe). The controller
+	// reads it for co-located volumes and forwards to the owner otherwise.
+	statsReg *stats.Registry
+	// mapper resolves Nomad volume id ↔ external id for the public stats API.
+	mapper stats.Mapper
+	// statsNS is the default Nomad namespace for stats id resolution / metrics.
+	statsNS string
 }
 
 func newController(z *zfs.ZFS, cfg *config.LocalConfig, parentDataset string, res cluster.Resolver, fwd *cluster.Client, log *zap.Logger) *controller {

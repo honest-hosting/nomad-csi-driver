@@ -66,7 +66,7 @@ package-preflight:
 	fi
 .PHONY: package-preflight
 
-release: release-preflight release-tag build ## Cut a new release on GitHub: ENVIRONMENT=production TAG=0.0.1 make release
+release: release-preflight release-tag ## Cut a new release on GitHub: ENVIRONMENT=production TAG=0.0.1 make release
 	@gh release create "$(TAG)"     \
 		"bin/$(APP_NAME)"           \
 		"bin/$(APP_NAME).sha256"    \
