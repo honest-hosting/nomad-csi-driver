@@ -102,19 +102,21 @@ func (c *controller) localCreate(ctx context.Context, a createArgs) (out createR
 }
 
 // checkCapacity refuses a create of size bytes when the pool's available space
-// (free minus its reserve) can't hold it.
+// (provisioned-aware `zfs available` minus its reserve) can't hold it. Using
+// `available` (not physical free) means thick zvols are charged at full size, so
+// the pool can't be overcommitted past its capacity.
 func (c *controller) checkCapacity(ctx context.Context, pool string, size int64) error {
-	free, err := c.z.PoolFree(ctx, pool)
+	avail, err := c.z.PoolAvailable(ctx, pool)
 	if err != nil {
-		return driver.Internal("zpool free: %v", err)
+		return driver.Internal("zfs available: %v", err)
 	}
 	total, err := c.z.PoolSize(ctx, pool)
 	if err != nil {
 		return driver.Internal("zpool size: %v", err)
 	}
-	avail := free - reserveBytes(total, c.cfg.ReserveFor(pool))
-	if avail < size {
-		return driver.OutOfRange("pool %q has %d bytes available after reserve, need %d", pool, max64(avail, 0), size)
+	availAfterReserve := avail - reserveBytes(total, c.cfg.ReserveFor(pool))
+	if availAfterReserve < size {
+		return driver.OutOfRange("pool %q has %d bytes available after reserve, need %d", pool, max64(availAfterReserve, 0), size)
 	}
 	return nil
 }
@@ -393,6 +395,10 @@ func (c *controller) localStats(ctx context.Context, pool string) (statsResult, 
 	if err != nil {
 		return statsResult{}, driver.Internal("zpool free: %v", err)
 	}
+	avail, err := c.z.PoolAvailable(ctx, pool)
+	if err != nil {
+		return statsResult{}, driver.Internal("zfs available: %v", err)
+	}
 	total, err := c.z.PoolSize(ctx, pool)
 	if err != nil {
 		return statsResult{}, driver.Internal("zpool size: %v", err)
@@ -400,7 +406,10 @@ func (c *controller) localStats(ctx context.Context, pool string) (statsResult, 
 	st.HasPool = true
 	st.VolumeCount = len(vols)
 	st.FreeBytes = free
-	st.AvailBytes = max64(free-reserveBytes(total, c.cfg.ReserveFor(pool)), 0)
+	// Placement is provisioned-aware: AvailBytes derives from `zfs available`
+	// (which charges each thick zvol's full size), not physical free, so a node
+	// hosting large-but-lightly-written zvols is correctly seen as fuller.
+	st.AvailBytes = max64(avail-reserveBytes(total, c.cfg.ReserveFor(pool)), 0)
 	return st, nil
 }
 

@@ -25,10 +25,10 @@ job "csi-qnap-controller" {
       # block surfaces the workload-identity token (env + file). REQUIRED when
       # forward_secret is set below — without it the controller can't enumerate
       # nodes/volumes and fails to start the fan-out. With Nomad ACLs enabled, bind
-      # a policy granting node:read + csi-read-volume:
+      # a policy granting node:read + csi-list-volume + csi-read-volume:
       #   cat > ncd.policy.hcl <<'EOF'
       #   node { policy = "read" }
-      #   namespace "default" { capabilities = ["csi-read-volume"] }
+      #   namespace "default" { capabilities = ["csi-list-volume", "csi-read-volume"] }
       #   EOF
       #   nomad acl policy apply -job csi-qnap-controller -group controller \
       #     -task plugin csi-qnap-ncd ncd.policy.hcl

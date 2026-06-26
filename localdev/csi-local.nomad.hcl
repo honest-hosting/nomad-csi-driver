@@ -71,11 +71,11 @@ job "nomad-csi-driver-local" {
       # Peer discovery reads Nomad's /v1/nodes over the task API socket; this
       # surfaces the workload-identity token (file is re-read for rotation, env
       # is the fallback). It reads /v1/nodes (discovery) + /v1/volumes (stats id
-      # resolution). With Nomad ACLs ENABLED, bind node:read + csi-read-volume
+      # resolution). With Nomad ACLs ENABLED, bind node:read + csi-list-volume + csi-read-volume
       # (ACLs off => no policy needed):
       #   cat > ncd.policy.hcl <<'EOF'
       #   node { policy = "read" }
-      #   namespace "default" { capabilities = ["csi-read-volume"] }
+      #   namespace "default" { capabilities = ["csi-list-volume", "csi-read-volume"] }
       #   EOF
       #   nomad acl policy apply -namespace default -job nomad-csi-driver-local \
       #     -group plugin -task plugin csi-local-ncd ncd.policy.hcl

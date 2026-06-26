@@ -243,13 +243,32 @@ func (z *ZFS) ListSnapshots(ctx context.Context, target string) ([]SnapshotEntry
 	return snaps, nil
 }
 
-// PoolFree returns free bytes in the pool.
+// PoolFree returns free bytes in the pool: `zpool get free`, which counts
+// physically allocated (written) blocks only — it does NOT account for dataset
+// reservations. Useful as a diagnostic of real on-disk usage, but NOT the right
+// signal for placement; use PoolAvailable for that.
 func (z *ZFS) PoolFree(ctx context.Context, pool string) (int64, error) {
 	out, err := z.run.Run(ctx, cexec.Command{Name: "zpool", Args: []string{"get", "-Hp", "-o", "value", "free", pool}})
 	if err != nil {
 		return 0, fmt.Errorf("zpool get free %s: %w", pool, err)
 	}
 	return parseInt(out.Stdout, "free")
+}
+
+// PoolAvailable returns the pool root dataset's available bytes (`zfs get
+// available`). Unlike PoolFree (pool-level physical free), the dataset-level
+// `available` property is reduced by descendant reservations. Because the driver
+// creates THICK zvols (CreateZvol passes no -s, so each carries a refreservation
+// equal to its volsize), this value reflects PROVISIONED/allocated space — the
+// sum of zvol sizes is charged against the pool the moment each zvol is created,
+// regardless of how much has actually been written. This is the correct signal
+// for placement and the create-time capacity guard.
+func (z *ZFS) PoolAvailable(ctx context.Context, pool string) (int64, error) {
+	out, err := z.run.Run(ctx, cexec.Command{Name: "zfs", Args: []string{"get", "-Hp", "-o", "value", "available", pool}})
+	if err != nil {
+		return 0, fmt.Errorf("zfs get available %s: %w", pool, err)
+	}
+	return parseInt(out.Stdout, "available")
 }
 
 // PoolHealthy reports whether the pool's health is ONLINE.

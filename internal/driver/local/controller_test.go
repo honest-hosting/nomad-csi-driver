@@ -235,7 +235,7 @@ func TestLocalMetrics_PlacementAndCapacity(t *testing.T) {
 
 	t.Run("reserve breach -> placement{host,ok} + capacity_reject", func(t *testing.T) {
 		mz := newMemZfs()
-		mz.free = 1000 // far below the requested size
+		mz.size = 1000 // provisioned-available (size - zvols) far below the requested size
 		c := metricsController(t, mz)
 		req := localCreateReq("p2", 16384)
 		req.Parameters = map[string]string{"host": "A", "fsType": "ext4"}
@@ -289,14 +289,19 @@ func collectGauges(t *testing.T, c prometheus.Collector) map[string]float64 {
 
 func TestPoolCollector(t *testing.T) {
 	mz := newMemZfs()
-	mz.free = 5000
+	mz.free = 5000 // physical (written) free
 	mz.size = 10000
-	mz.vols["tank/csi/v1"] = 16384 // one zvol under the pool's parent dataset
+	mz.vols["tank/csi/v1"] = 4000 // one thick zvol: charges 4000 of provisioned space
 
 	g := collectGauges(t, newPoolCollector(zfs.New(mz), testConfig(), "local", zap.NewNop()))
 	assert.Equal(t, 1.0, g["nomad_csi_local_pool_online{pool=tank}"])
-	assert.Equal(t, 5000.0, g["nomad_csi_local_pool_free_bytes{pool=tank}"])
-	assert.Equal(t, 5000.0, g["nomad_csi_local_pool_avail_bytes{pool=tank}"], "reserve 0 -> avail == free")
+	// Physical axis: size = allocated + free.
+	assert.Equal(t, 10000.0, g["nomad_csi_local_pool_size_bytes{pool=tank}"])
+	assert.Equal(t, 5000.0, g["nomad_csi_local_pool_allocated_bytes{pool=tank}"], "allocated == size - free (10000-5000)")
+	assert.Equal(t, 5000.0, g["nomad_csi_local_pool_free_bytes{pool=tank}"], "free_bytes is physical (written) free")
+	// Provisioned axis: available == size - provisioned - reserve.
+	assert.Equal(t, 6000.0, g["nomad_csi_local_pool_available_bytes{pool=tank}"], "reserve 0 -> available == size - provisioned (10000-4000)")
+	assert.Equal(t, 0.0, g["nomad_csi_local_pool_reserve_bytes{pool=tank}"])
 	assert.Equal(t, 1.0, g["nomad_csi_local_pool_volumes{pool=tank}"])
 
 	// An absent pool reports online=0 and no capacity series.
@@ -311,7 +316,8 @@ func TestGetCapacity(t *testing.T) {
 	c, _ := singleNodeController(t)
 	avail, err := c.GetCapacity(context.Background(), nil, nil)
 	require.NoError(t, err)
-	assert.Equal(t, int64(1)<<42, avail)
+	// Provisioned-aware available with no zvols and reserve 0 == pool size.
+	assert.Equal(t, int64(1)<<43, avail)
 }
 
 // --- forwarding (two-node) ---
@@ -391,11 +397,11 @@ func TestForward_CodedErrorPreservedAcrossForward(t *testing.T) {
 	assert.Equal(t, driver.CodeFailedPrecondition, de.Code, "remote code preserved across forward")
 }
 
-func TestForward_AutoPicksFewestVolumes(t *testing.T) {
+func TestForward_AutoPicksRoomiest(t *testing.T) {
 	ca, mzB, cleanup := twoNodeSetup(t)
 	defer cleanup()
 
-	// Pin a volume explicitly to A so B becomes the emptier node.
+	// Pin a volume explicitly to A so B becomes the emptier (more-available) node.
 	a1 := localCreateReq("a1", 16384)
 	a1.Parameters = map[string]string{"host": "A"}
 	_, err := ca.CreateVolume(context.Background(), a1)
@@ -404,7 +410,48 @@ func TestForward_AutoPicksFewestVolumes(t *testing.T) {
 	vol, err := ca.CreateVolume(context.Background(), localCreateReq("auto", 16384))
 	require.NoError(t, err)
 	eid, _ := parseExternalID(vol.VolumeID)
-	assert.Equal(t, "B", eid.Node, "auto placed on the emptier node")
+	assert.Equal(t, "B", eid.Node, "auto placed on the node with more available space")
+	assert.True(t, mzB.hasVol("tank/csi/auto"))
+}
+
+// twoNodeSetupBoth is twoNodeSetup but exposes BOTH nodes' backing ZFS, so a
+// test can stage asymmetric capacity vs. volume-count.
+func twoNodeSetupBoth(t *testing.T) (ca *controller, mzA, mzB *memZfs, cleanup func()) {
+	t.Helper()
+	secret := "s3cret"
+
+	mzB = newMemZfs()
+	cB := newController(zfs.New(mzB), testConfig(), "local", &cluster.StaticResolver{Self: "B", Peers: nil}, cluster.NewClient(secret), zap.NewNop())
+	srvB := httptest.NewServer(cluster.NewServer(secret, cB.dispatchForward))
+
+	resA := &cluster.StaticResolver{Self: "A", Peers: []cluster.NodeInfo{
+		{Node: "A", Addr: "127.0.0.1:1"},
+		{Node: "B", Addr: strings.TrimPrefix(srvB.URL, "http://")},
+	}}
+	mzA = newMemZfs()
+	ca = newController(zfs.New(mzA), testConfig(), "local", resA, cluster.NewClient(secret), zap.NewNop())
+	return ca, mzA, mzB, srvB.Close
+}
+
+// Capacity-based placement: the node with FEWER volumes but LESS available space
+// must lose to the emptier node — the exact case the old volume-count heuristic
+// got wrong (one large, mostly-provisioned zvol looked "less loaded" than three
+// tiny ones). Both nodes have room for the request, so this exercises ranking,
+// not the availability filter.
+func TestForward_AutoPicksMostAvailableNotFewestVolumes(t *testing.T) {
+	ca, mzA, mzB, cleanup := twoNodeSetupBoth(t)
+	defer cleanup()
+
+	mzA.size, mzB.size = 100000, 100000
+	mzA.vols["tank/csi/big"] = 50000 // 1 volume, ~50000 available
+	mzB.vols["tank/csi/s1"] = 1000   // 3 volumes, ~97000 available
+	mzB.vols["tank/csi/s2"] = 1000
+	mzB.vols["tank/csi/s3"] = 1000
+
+	vol, err := ca.CreateVolume(context.Background(), localCreateReq("auto", 16384))
+	require.NoError(t, err)
+	eid, _ := parseExternalID(vol.VolumeID)
+	assert.Equal(t, "B", eid.Node, "placed on the node with more available space, despite it holding more volumes")
 	assert.True(t, mzB.hasVol("tank/csi/auto"))
 }
 
