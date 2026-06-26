@@ -57,6 +57,61 @@ format/mount layer.
   grow-only. A clone/restore records its source so an idempotent retry can't
   silently alias a same-named volume from a different source.
 
+## Architecture: control plane only (zero-disruption upgrades)
+
+The plugin is a **control-plane shim**, never a data-plane component. It *issues*
+storage operations — provision, attach, `mount`, `unmount` — and then steps out of
+the I/O path entirely. The bytes a running workload reads and writes never traverse
+the plugin process. This is a deliberate choice, and it's what lets you **upgrade,
+restart, or reschedule the plugin with running workloads untouched** — no restarts,
+no remounts, no I/O interruption.
+
+The reason is *where the data plane lives*: the **host kernel** (and host daemons),
+not the plugin container.
+
+- **local (ZFS)** — `NodeStage`/`Publish` is a kernel mount of
+  `/dev/zvol/<pool>/<vol>` plus a `mount --bind` into the alloc dir. Live I/O is
+  workload → kernel VFS → ZFS → disk.
+- **qnap (iSCSI + multipath)** — the plugin drives the **host's** `iscsid` (login →
+  `/dev/sdX`) and the **host's** `multipathd` (assembles `/dev/mapper/<wwid>`), then
+  kernel-mounts the result. Live I/O is workload → kernel FS → dm-multipath →
+  in-kernel iSCSI initiator → SAN. (This is why the node task bind-mounts
+  `/etc/iscsi`, `/etc/multipath`, and `/run/lock` from the host — it configures the
+  host's daemons; it does **not** run its own.)
+
+Kill the plugin container in either mode and the iSCSI sessions, multipath maps, and
+mounts all persist on the host. Two mechanisms make this hold:
+
+1. **Shared mount propagation** — Nomad's `csi_plugin` stanza bind-mounts the
+   plugin's `mount_dir` with bidirectional propagation, so mounts the plugin makes
+   propagate **out** to the host namespace and **into** the workload's. They aren't
+   owned by the plugin container's namespace and don't die with it. (`privileged =
+   true` is what permits this.)
+2. **Decoupled allocations** — Nomad never restarts a *consuming* workload because
+   the *plugin* job changed; they're separate allocs and the consumer's volume claim
+   survives a plugin restart. (True of any CSI plugin on Nomad — so a workload
+   restart on plugin update is always a *data-plane-in-the-plugin* symptom, not
+   something the orchestrator imposes.)
+
+**What this avoids:** the disruption inherent to drivers whose data plane lives *in*
+the plugin/daemon process — e.g. hyperconverged stores like Portworx (the `px`
+daemon *is* the backend), or NFS/FUSE drivers that mount inside the container's
+private namespace or proxy I/O through an in-pod server. For those, a plugin restart
+yields stale handles ("transport endpoint not connected") and **forces every
+consuming workload to restart**. Here, a rolling image bump is a non-event for
+running workloads — which is exactly why the storage jobspecs can roll one node at a
+time and soak on health without ever draining workloads.
+
+**Boundaries** (all seconds-scale; none restart a steady workload):
+
+- While the plugin is down you cannot perform **new** stage/publish/unpublish on that
+  node — existing mounts are unaffected, but fresh attach/detach waits for the plugin.
+- A workload that **independently** restarts during the plugin-down window blocks on
+  re-publish until the plugin returns, then proceeds.
+- A **host reboot** is different in kind: it tears down the in-kernel sessions and
+  mounts, and everything re-stages on boot. The survival property is about *plugin*
+  restarts, not *host* restarts.
+
 ## Usage
 
 ```bash
