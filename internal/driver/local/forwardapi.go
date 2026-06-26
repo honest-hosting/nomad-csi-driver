@@ -82,11 +82,12 @@ type statsArgs struct {
 type statsResult struct {
 	Node    string `json:"node"`
 	HasPool bool   `json:"has_pool"` // false if the pool isn't imported/ONLINE here
-	// VolumeCount is scoped to the requested pool's parent dataset (the auto
-	// tie-break is fewest-volumes within the target pool, not node-global).
+	// VolumeCount is scoped to the requested pool's parent dataset. It is the
+	// auto-placement tie-break (when two nodes have equal available bytes), not
+	// the primary ranking key.
 	VolumeCount int   `json:"volume_count"`
-	FreeBytes   int64 `json:"free_bytes"`  // raw pool free
-	AvailBytes  int64 `json:"avail_bytes"` // free minus the pool's reserve (>=0)
+	FreeBytes   int64 `json:"free_bytes"`  // physical (written) pool free; diagnostic only
+	AvailBytes  int64 `json:"avail_bytes"` // provisioned-aware available minus the pool's reserve (>=0)
 }
 
 type volWire struct {

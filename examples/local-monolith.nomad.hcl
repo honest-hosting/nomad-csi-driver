@@ -72,10 +72,10 @@ job "csi-local" {
       # Peer discovery (/v1/nodes) and the stats query API's Nomad-id resolution
       # (/v1/volumes) both go over the task API socket; the identity block
       # surfaces the workload-identity token (env + file). With ACLs enabled, bind
-      # a policy granting node:read + csi-read-volume to this task, e.g.:
+      # a policy granting node:read + csi-list-volume + csi-read-volume to this task, e.g.:
       #   cat > ncd.policy.hcl <<'EOF'
       #   node { policy = "read" }
-      #   namespace "default" { capabilities = ["csi-read-volume"] }
+      #   namespace "default" { capabilities = ["csi-list-volume", "csi-read-volume"] }
       #   EOF
       #   nomad acl policy apply -job csi-local -group monolith -task plugin \
       #     csi-local-ncd ncd.policy.hcl

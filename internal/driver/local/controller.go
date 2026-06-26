@@ -184,7 +184,8 @@ func (c *controller) DeleteSnapshot(ctx context.Context, id string, _ map[string
 
 // GetCapacity reports provisioning headroom for the requested pool (controller-
 // level, pre-volume) — distinct from NodeGetVolumeStats, which reports a mounted
-// zvol's usage. Reports this node's free bytes for the pool (0 if absent here).
+// zvol's usage. Reports this node's provisioned-aware available bytes (after the
+// pool's reserve), matching the placement/create accounting (0 if absent here).
 func (c *controller) GetCapacity(ctx context.Context, _ []driver.Topology, params map[string]string) (int64, error) {
 	pool := c.cfg.DefaultPool
 	if v := params["pool"]; v != "" {
@@ -200,11 +201,15 @@ func (c *controller) GetCapacity(ctx context.Context, _ []driver.Topology, param
 	if !present || !online {
 		return 0, nil
 	}
-	free, err := c.z.PoolFree(ctx, pool)
+	avail, err := c.z.PoolAvailable(ctx, pool)
 	if err != nil {
-		return 0, driver.Internal("zpool free: %v", err)
+		return 0, driver.Internal("zfs available: %v", err)
 	}
-	return free, nil
+	total, err := c.z.PoolSize(ctx, pool)
+	if err != nil {
+		return 0, driver.Internal("zpool size: %v", err)
+	}
+	return max64(avail-reserveBytes(total, c.cfg.ReserveFor(pool)), 0), nil
 }
 
 // ListVolumes aggregates volumes across all peer nodes, tagging each with its
@@ -306,7 +311,8 @@ func (c *controller) ControllerUnpublishVolume(context.Context, string, string, 
 // placeVolume resolves the owner node for a new volume. A content source forces
 // the volume onto the source's node (clones/restores are node-local).
 // Otherwise an explicit host pins (and must have the requested pool); "auto"
-// picks the fewest-volumes node that has the pool with room (§5.1).
+// picks the node with the most available (provisioned-aware) space in the pool
+// (§5.1).
 func (c *controller) placeVolume(ctx context.Context, vp volumeParams, size int64, src *driver.ContentSource) (node string, err error) {
 	mode := "auto"
 	defer func() { c.recordPlacement(mode, err) }()
@@ -342,7 +348,7 @@ func (c *controller) placeVolume(ctx context.Context, vp volumeParams, size int6
 		}
 		return vp.host, nil
 	}
-	return c.pickFewestVolumes(ctx, vp.pool, size)
+	return c.pickRoomiest(ctx, vp.pool, size)
 }
 
 func (c *controller) validateNode(ctx context.Context, node string) error {
@@ -358,11 +364,16 @@ func (c *controller) validateNode(ctx context.Context, node string) error {
 	return driver.InvalidArgument("host %q is not a known local-driver node", node)
 }
 
-// pickFewestVolumes implements host=auto for a given pool: among nodes that
-// have the pool ONLINE with room for `size` after reserve, the one with the
-// fewest volumes in that pool (ties broken by node name for determinism). It is
-// storage-balancing only — compute-blind, by design.
-func (c *controller) pickFewestVolumes(ctx context.Context, pool string, size int64) (string, error) {
+// pickRoomiest implements host=auto for a given pool: among nodes that have the
+// pool ONLINE with room for `size` after reserve, the one with the MOST available
+// bytes (ties broken by fewest volumes, then node name for determinism).
+//
+// "Available" is provisioned-aware (`zfs available`, see PoolAvailable), so each
+// thick zvol is charged at its full size regardless of how much it has actually
+// written. This balances on real remaining capacity, not volume count: a node
+// with one large, mostly-empty zvol is correctly seen as fuller than nodes whose
+// pools are nearly untouched. It is storage-balancing only — compute-blind.
+func (c *controller) pickRoomiest(ctx context.Context, pool string, size int64) (string, error) {
 	peers, err := c.listPeers(ctx)
 	if err != nil {
 		return "", driver.Unavailable("listing peers: %v", err)
@@ -371,6 +382,7 @@ func (c *controller) pickFewestVolumes(ctx context.Context, pool string, size in
 		return "", driver.Unavailable("no local-driver nodes available for placement")
 	}
 	best := ""
+	var bestAvail int64 = -1
 	bestCount := math.MaxInt
 	for _, p := range peers {
 		st, err := c.statsFor(ctx, p.Node, pool)
@@ -384,12 +396,15 @@ func (c *controller) pickFewestVolumes(ctx context.Context, pool string, size in
 		if st.AvailBytes < size {
 			continue // no room after the pool's reserve
 		}
-		if st.VolumeCount < bestCount || (st.VolumeCount == bestCount && p.Node < best) {
-			best, bestCount = p.Node, st.VolumeCount
+		switch {
+		case st.AvailBytes > bestAvail,
+			st.AvailBytes == bestAvail && st.VolumeCount < bestCount,
+			st.AvailBytes == bestAvail && st.VolumeCount == bestCount && p.Node < best:
+			best, bestAvail, bestCount = p.Node, st.AvailBytes, st.VolumeCount
 		}
 	}
 	if best == "" {
-		return "", driver.Unavailable("no local-driver node has pool %q online with %d bytes free", pool, size)
+		return "", driver.Unavailable("no local-driver node has pool %q online with %d bytes available", pool, size)
 	}
 	return best, nil
 }

@@ -77,7 +77,8 @@ nomad-csi-driver run \
   create/delete/expand/snapshot to the owning node (peer discovery via Nomad's
   `/v1/nodes` API over the task API socket — the plugin task needs an `identity`
   block, plus, when ACLs are enabled, `node:read` and — for the stats query API's
-  Nomad-id resolution — `csi-read-volume` in the queried namespace).
+  Nomad-id resolution, which **lists** `/v1/volumes` — `csi-list-volume`
+  (and `csi-read-volume`) in the queried namespace).
 
 **Workload-identity discovery is mandatory** — there is no static peer table.
 A deployment without an `identity` block / reachable `api.sock` fails fast at
@@ -422,10 +423,9 @@ aggregate gauges):
 ## Development
 
 ```bash
-make build              # -> bin/nomad-csi-driver (version-stamped)
+make build              # build + lint, creates 'bin/nomad-csi-driver' (version-stamped)
 make test               # unit tests (race), hermetic; integration excluded by build tag
-make lint               # golangci-lint
-make package            # build + push the container image via Packer (DOCKER_* creds)
+make package            # build + push the container image via Packer (DOCKER_* creds) as 'latest' tag
 make test-integration   # e2e against an EXTERNAL Nomad cluster (NOMAD_ADDR) — see localdev/
 ```
 

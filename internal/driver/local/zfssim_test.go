@@ -116,6 +116,20 @@ func (m *memZfs) zfs(args []string) (cexec.Output, error) {
 		if prop == "creation" {
 			return cexec.Output{Stdout: []byte(strconv.FormatInt(simCreationUnix, 10) + "\n")}, nil
 		}
+		if prop == "available" {
+			// Provisioned-aware (thick) accounting: the pool root's available is
+			// its size minus the sum of every zvol's volsize (each thick zvol
+			// carries a refreservation equal to its volsize), regardless of how
+			// much has actually been written.
+			avail := m.size
+			for _, sz := range m.vols {
+				avail -= sz
+			}
+			if avail < 0 {
+				avail = 0
+			}
+			return cexec.Output{Stdout: []byte(strconv.FormatInt(avail, 10) + "\n")}, nil
+		}
 		if prop == "volblocksize" {
 			return cexec.Output{Stdout: []byte(strconv.FormatInt(m.blocksize, 10) + "\n")}, nil
 		}

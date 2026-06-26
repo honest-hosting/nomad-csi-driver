@@ -8,8 +8,8 @@ import (
 	"github.com/honest-hosting/nomad-csi-driver/internal/driver"
 )
 
-// hostAuto is the placement value meaning "the controller picks the
-// fewest-volumes node". An explicit node name pins to that node.
+// hostAuto is the placement value meaning "the controller picks the node with
+// the most available space". An explicit node name pins to that node.
 const hostAuto = "auto"
 
 // volumeParams are the per-volume settings resolved for a local volume.

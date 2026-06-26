@@ -25,8 +25,8 @@ local {
   # Peer discovery is via Nomad's own /v1/nodes API over the task API socket
   # (api.sock) — no external service, and the ONLY mechanism (no static peer
   # table). It requires an `identity` block on the plugin task (see the jobspec)
-  # and, with ACLs enabled, a `node:read` policy (plus `csi-read-volume` for the
-  # stats query API). It covers single- AND multi-node clusters; for a lone node
+  # and, with ACLs enabled, a `node:read` policy (plus `csi-list-volume` and
+  # `csi-read-volume` for the stats query API's volume lookups). It covers single- AND multi-node clusters; for a lone node
   # every op resolves to self. The block is OPTIONAL — omit it for all defaults
   # (api.sock + nomad_token from NOMAD_SECRETS_DIR, scoped to $NOMAD_DC, 5m
   # cache). Shown here with the defaults made explicit:
