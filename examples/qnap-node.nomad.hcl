@@ -13,7 +13,7 @@ job "csi-qnap-node" {
         image = "quay.io/honesthosting/nomad-csi-driver:latest"
         # node-id uses the stable node NAME (matches /v1/nodes[].Name and the
         # stats `node` label), not the UUID.
-        args = ["run", "--driver=qnap", "--mode=node", "--node-id=${node.unique.name}", "--config=/local/config.hcl"]
+        args = ["run", "--driver=qnap", "--mode=node", "--node-id=${node.unique.name}", "--plugin-id=qnap", "--config=/local/config.hcl"]
         # privileged + host networking: iSCSI/multipath are HOST-side (kernel
         # modules + iscsid + multipathd on the host). privileged already
         # bind-mounts host /dev (the iSCSI/dm device nodes — do NOT add /dev:/dev,

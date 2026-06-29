@@ -17,8 +17,9 @@ type NodeMetrics struct {
 	staged        prometheus.Gauge // volumes currently staged on this node
 }
 
-// NewNodeMetrics registers the node collectors on reg.
-func NewNodeMetrics(reg *prometheus.Registry) *NodeMetrics {
+// NewNodeMetrics registers the node collectors on reg (the identity-wrapping
+// Registerer, so they inherit the constant driver/mode/node_id/plugin_id labels).
+func NewNodeMetrics(reg prometheus.Registerer) *NodeMetrics {
 	m := &NodeMetrics{
 		mountTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "nomad_csi", Subsystem: "node", Name: "mount_total",

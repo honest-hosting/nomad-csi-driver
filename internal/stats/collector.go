@@ -47,9 +47,11 @@ func newCollector(provider func() []PublicVolumeStats, perVolume bool, staleAfte
 	return &collector{provider: provider, perVolume: perVolume, staleAfter: staleAfter, nowFn: nowFn}
 }
 
-// RegisterCollector registers a per-volume usage collector on reg, backed by
-// provider (a Source's relabeled snapshot). No-op if reg or provider is nil.
-func RegisterCollector(reg *prometheus.Registry, provider func() []PublicVolumeStats, perVolume bool, staleAfter time.Duration) error {
+// RegisterCollector registers a per-volume usage collector on reg (the
+// identity-wrapping Registerer, so the series inherit the constant
+// driver/mode/node_id/plugin_id labels), backed by provider (a Source's relabeled
+// snapshot). No-op if reg or provider is nil.
+func RegisterCollector(reg prometheus.Registerer, provider func() []PublicVolumeStats, perVolume bool, staleAfter time.Duration) error {
 	if reg == nil || provider == nil {
 		return nil
 	}

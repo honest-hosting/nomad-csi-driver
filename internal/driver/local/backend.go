@@ -35,7 +35,7 @@ func nodeMetrics(d driver.Deps) *metrics.NodeMetrics {
 	if d.Metrics == nil {
 		return nil
 	}
-	return metrics.NewNodeMetrics(d.Metrics.Registry())
+	return metrics.NewNodeMetrics(d.Metrics.Registerer())
 }
 
 func init() { driver.Register("local", New) }
@@ -110,8 +110,9 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 		zap.String("layout", "<pool>/"+parentDataset+"/<volume-id>"))
 	ctrl := newController(z, cfg, parentDataset, res, fwd, log)
 	if d.Metrics != nil {
-		reg := d.Metrics.Registry()
+		reg := d.Metrics.Registerer() // identity-wrapping; collectors inherit constant labels
 		ctrl.metrics = newLocalMetrics(reg)
+		ctrl.cluster = metrics.NewClusterMetrics(reg)                  // shared forward/resolve/peers
 		reg.MustRegister(newPoolCollector(z, cfg, parentDataset, log)) // pool gauges, computed on scrape
 	}
 	nm := nodeMetrics(d) // shared node metrics (mount + staged), also the mounter's sink
@@ -175,7 +176,7 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 	// across node scrapes; cross-node queries forward to the owner).
 	if statsCfg.Enabled {
 		if d.Metrics != nil {
-			if err := stats.RegisterCollector(d.Metrics.Registry(), ctrl.metricsSnapshot, statsCfg.MetricsPerVolume, statsCfg.StaleAfter); err != nil {
+			if err := stats.RegisterCollector(d.Metrics.Registerer(), ctrl.metricsSnapshot, statsCfg.MetricsPerVolume, statsCfg.StaleAfter); err != nil {
 				return nil, driver.Internal("registering stats collector: %v", err)
 			}
 		}

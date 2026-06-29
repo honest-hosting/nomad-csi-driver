@@ -121,6 +121,8 @@ job "nomad-csi-driver-qnap-controller" {
           "run",
           "--driver=qnap",
           "--mode=controller",
+          "--node-id=${node.unique.name}",
+          "--plugin-id=${var.plugin_id}",
           "--config=/local/config.hcl",
           "--log-level=debug",
         ]

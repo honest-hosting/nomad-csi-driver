@@ -51,6 +51,7 @@ job "nomad-csi-driver-qnap-node" {
           "--driver=qnap",
           "--mode=node",
           "--node-id=${node.unique.name}",
+          "--plugin-id=${var.plugin_id}",
           "--config=/local/config.hcl",
           "--log-level=debug",
         ]

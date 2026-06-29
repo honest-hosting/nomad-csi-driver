@@ -13,7 +13,7 @@ job "csi-qnap-controller" {
 
       config {
         image = "quay.io/honesthosting/nomad-csi-driver:latest"
-        args  = ["run", "--driver=qnap", "--mode=controller", "--config=/local/config.hcl"]
+        args  = ["run", "--driver=qnap", "--mode=controller", "--node-id=${node.unique.name}", "--plugin-id=qnap", "--config=/local/config.hcl"]
         # host networking so the controller reaches the appliance and binds its
         # reachable ports: metrics (:9501) and the stats query API (:9611).
         privileged   = true

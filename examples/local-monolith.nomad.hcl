@@ -18,7 +18,7 @@ job "csi-local" {
         # zvols land under <pool>/nomad-csi/<volume-id> by default. Add
         # --parent-dataset=<name> (e.g. your csi_plugin id) to namespace per
         # deployment, or set parent_dataset per pool in the config below.
-        args = ["run", "--driver=local", "--mode=monolith", "--node-id=${node.unique.name}", "--config=/local/config.hcl"]
+        args = ["run", "--driver=local", "--mode=monolith", "--node-id=${node.unique.name}", "--plugin-id=local", "--config=/local/config.hcl"]
         # privileged: the cgroup device controller must permit /dev/zfs (a
         # non-privileged container is denied EPERM). host networking so the
         # forwarding (:9602) + stats query (:9610) + metrics (:9503) ports bind
