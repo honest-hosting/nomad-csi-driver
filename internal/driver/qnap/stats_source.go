@@ -3,12 +3,15 @@ package qnap
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"sync"
 	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/honest-hosting/nomad-csi-driver/internal/cluster"
+	"github.com/honest-hosting/nomad-csi-driver/internal/metrics"
 	"github.com/honest-hosting/nomad-csi-driver/internal/stats"
 )
 
@@ -25,8 +28,9 @@ const perNodeFanoutTimeout = 10 * time.Second
 type qnapSource struct {
 	res         cluster.Resolver
 	fwd         *cluster.Client
-	mapper      stats.Mapper // Nomad id ↔ external id
-	namespace   string       // default namespace for metrics relabel
+	mapper      stats.Mapper            // Nomad id ↔ external id
+	cluster     *metrics.ClusterMetrics // shared forward/resolve/peers (nil-safe)
+	namespace   string                  // default namespace for metrics relabel
 	interval    time.Duration
 	nodeTimeout time.Duration
 	log         *zap.Logger
@@ -38,7 +42,7 @@ type qnapSource struct {
 	cache map[string]stats.CSIVolumeStats // keyed by external id
 }
 
-func newQNAPSource(res cluster.Resolver, fwd *cluster.Client, mapper stats.Mapper, namespace string, interval time.Duration, log *zap.Logger) *qnapSource {
+func newQNAPSource(res cluster.Resolver, fwd *cluster.Client, mapper stats.Mapper, namespace string, interval time.Duration, cm *metrics.ClusterMetrics, log *zap.Logger) *qnapSource {
 	if interval <= 0 {
 		interval = stats.DefaultAggregateInterval
 	}
@@ -50,7 +54,7 @@ func newQNAPSource(res cluster.Resolver, fwd *cluster.Client, mapper stats.Mappe
 	}
 	base, cancel := context.WithCancel(context.Background())
 	q := &qnapSource{
-		res: res, fwd: fwd, mapper: mapper, namespace: namespace,
+		res: res, fwd: fwd, mapper: mapper, cluster: cm, namespace: namespace,
 		interval: interval, nodeTimeout: perNodeFanoutTimeout,
 		log: log, base: base, cancel: cancel, cache: map[string]stats.CSIVolumeStats{},
 	}
@@ -77,10 +81,12 @@ func (q *qnapSource) loop() {
 // collector never blocks on a single node.
 func (q *qnapSource) collectOnce(ctx context.Context) {
 	nodes, err := q.res.List(ctx)
+	q.cluster.Resolve(err)
 	if err != nil {
 		q.log.Warn("qnap stats: node discovery failed", zap.Error(err))
 		return
 	}
+	q.cluster.SetPeers(len(nodes))
 	agg := make(map[string]stats.CSIVolumeStats)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -92,14 +98,17 @@ func (q *qnapSource) collectOnce(ctx context.Context) {
 			defer cancel()
 			body, err := q.fwd.Call(cctx, n.Addr, stats.MethodVolStatsDump, nil)
 			if err != nil {
+				q.cluster.Forward(stats.MethodVolStatsDump, forwardOutcome(err))
 				q.log.Debug("qnap stats: node fan-out failed", zap.String("node", n.Node), zap.Error(err))
 				return
 			}
 			var items []stats.CSIVolumeStats
 			if err := json.Unmarshal(body, &items); err != nil {
+				q.cluster.Forward(stats.MethodVolStatsDump, "error")
 				q.log.Debug("qnap stats: decode failed", zap.String("node", n.Node), zap.Error(err))
 				return
 			}
+			q.cluster.Forward(stats.MethodVolStatsDump, "ok")
 			mu.Lock()
 			for _, it := range items {
 				agg[it.VolumeID] = it // a volume lives on one node; last writer wins
@@ -172,4 +181,15 @@ func (q *qnapSource) Close() {
 	if q != nil {
 		q.cancel()
 	}
+}
+
+// forwardOutcome classifies a fan-out forward error for cluster_forward_total: a
+// transport/network failure (node down, dial timeout, per-node deadline) is
+// "unreachable"; anything else (a node-reported op error) is "error".
+func forwardOutcome(err error) string {
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return "unreachable"
+	}
+	return "error"
 }

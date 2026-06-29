@@ -94,6 +94,7 @@ job "nomad-csi-driver-local" {
           "--driver=local",
           "--mode=monolith",
           "--node-id=${node.unique.name}",
+          "--plugin-id=${var.plugin_id}",
           "--parent-dataset=${var.plugin_id}", # ZFS parent dataset: <pool>/${var.plugin_id}/<vol-id> (namespace per deployment)
           "--config=/local/config.hcl",
           "--log-level=debug",

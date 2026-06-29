@@ -31,7 +31,7 @@ func nodeMetrics(d driver.Deps) *metrics.NodeMetrics {
 	if d.Metrics == nil {
 		return nil
 	}
-	return metrics.NewNodeMetrics(d.Metrics.Registry())
+	return metrics.NewNodeMetrics(d.Metrics.Registerer())
 }
 
 func init() { driver.Register("qnap", New) }
@@ -93,7 +93,7 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 		if err := validateControllerConfig(cfg); err != nil {
 			return nil, err
 		}
-		cl, err := newQNAPClient(cfg, d.Metrics.Registry(), log)
+		cl, err := newQNAPClient(cfg, d.Metrics.Registerer(), log)
 		if err != nil {
 			return nil, driver.Internal("creating qnap client: %v", err)
 		}
@@ -113,7 +113,7 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 		mpath := multipath.New(d.Runner, cfg.MultipathConfigDir)
 		var qnm *qnapNodeMetrics
 		if d.Metrics != nil {
-			qnm = newQNAPNodeMetrics(d.Metrics.Registry())
+			qnm = newQNAPNodeMetrics(d.Metrics.Registerer())
 		}
 		nm := nodeMetrics(d)
 		b.statsReg = stats.NewRegistry(statsCfg, d.NodeID, log)
@@ -191,9 +191,13 @@ func (b *backend) setupStats(d driver.Deps, cfg *config.QNAPConfig, statsCfg sta
 		if err != nil {
 			return err
 		}
-		b.source = newQNAPSource(res, cluster.NewClient(cfg.ForwardSecret), mapper, statsCfg.Namespace, statsCfg.AggregateInterval, log)
+		var cm *metrics.ClusterMetrics
 		if d.Metrics != nil {
-			if err := stats.RegisterCollector(d.Metrics.Registry(), b.source.metricsSnapshot, statsCfg.MetricsPerVolume, statsCfg.StaleAfter); err != nil {
+			cm = metrics.NewClusterMetrics(d.Metrics.Registerer()) // shared forward/resolve/peers
+		}
+		b.source = newQNAPSource(res, cluster.NewClient(cfg.ForwardSecret), mapper, statsCfg.Namespace, statsCfg.AggregateInterval, cm, log)
+		if d.Metrics != nil {
+			if err := stats.RegisterCollector(d.Metrics.Registerer(), b.source.metricsSnapshot, statsCfg.MetricsPerVolume, statsCfg.StaleAfter); err != nil {
 				return driver.Internal("registering stats collector: %v", err)
 			}
 		}
@@ -289,7 +293,7 @@ func validateControllerConfig(cfg *config.QNAPConfig) error {
 // registered on the shared registry (so every appliance call is measured) AND
 // to structured zap logging: each request is logged at debug, and a failed
 // operation at info, so go-qnap calls can be traced from the plugin's logs.
-func qnapHooks(reg *prometheus.Registry, log *zap.Logger) goqnap.Hooks {
+func qnapHooks(reg prometheus.Registerer, log *zap.Logger) goqnap.Hooks {
 	opDur := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: "nomad_csi", Subsystem: "qnap", Name: "op_duration_seconds",
 		Help: "Duration of go-qnap operations by op and success.", Buckets: prometheus.DefBuckets,
@@ -344,7 +348,7 @@ type qnapNodeMetrics struct {
 	deviceWait *prometheus.CounterVec // {outcome=ok|timeout}
 }
 
-func newQNAPNodeMetrics(reg *prometheus.Registry) *qnapNodeMetrics {
+func newQNAPNodeMetrics(reg prometheus.Registerer) *qnapNodeMetrics {
 	m := &qnapNodeMetrics{
 		iscsiLogin: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "nomad_csi", Subsystem: "qnap", Name: "iscsi_login_total",

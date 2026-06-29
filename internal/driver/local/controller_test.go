@@ -17,6 +17,7 @@ import (
 	"github.com/honest-hosting/nomad-csi-driver/internal/cluster"
 	"github.com/honest-hosting/nomad-csi-driver/internal/config"
 	"github.com/honest-hosting/nomad-csi-driver/internal/driver"
+	"github.com/honest-hosting/nomad-csi-driver/internal/metrics"
 	"github.com/honest-hosting/nomad-csi-driver/internal/zfs"
 )
 
@@ -221,6 +222,7 @@ func metricsController(t *testing.T, mz *memZfs) *controller {
 	res := &cluster.StaticResolver{Self: "A", Peers: []cluster.NodeInfo{{Node: "A", Addr: "127.0.0.1:1"}}}
 	c := newController(zfs.New(mz), testConfig(), "local", res, cluster.NewClient("s3cret"), zap.NewNop())
 	c.metrics = newLocalMetrics(prometheus.NewRegistry())
+	c.cluster = metrics.NewClusterMetrics(prometheus.NewRegistry())
 	return c
 }
 
@@ -230,7 +232,7 @@ func TestLocalMetrics_PlacementAndCapacity(t *testing.T) {
 		_, err := c.CreateVolume(context.Background(), localCreateReq("p1", 16384))
 		require.NoError(t, err)
 		assert.Equal(t, 1.0, testutil.ToFloat64(c.metrics.placementTotal.WithLabelValues("auto", "ok")))
-		assert.GreaterOrEqual(t, testutil.ToFloat64(c.metrics.resolveTotal.WithLabelValues("ok")), 1.0)
+		assert.GreaterOrEqual(t, testutil.ToFloat64(c.cluster.ResolveCounter("ok")), 1.0)
 	})
 
 	t.Run("reserve breach -> placement{host,ok} + capacity_reject", func(t *testing.T) {
@@ -251,12 +253,13 @@ func TestLocalMetrics_Forward(t *testing.T) {
 	ca, _, cleanup := twoNodeSetup(t)
 	defer cleanup()
 	ca.metrics = newLocalMetrics(prometheus.NewRegistry())
+	ca.cluster = metrics.NewClusterMetrics(prometheus.NewRegistry())
 
 	req := localCreateReq("remote", 16384)
 	req.Parameters = map[string]string{"host": "B"}
 	_, err := ca.CreateVolume(context.Background(), req)
 	require.NoError(t, err)
-	assert.Equal(t, 1.0, testutil.ToFloat64(ca.metrics.forwardTotal.WithLabelValues("create", "ok")),
+	assert.Equal(t, 1.0, testutil.ToFloat64(ca.cluster.ForwardCounter("create", "ok")),
 		"forwarded create records forward{create,ok}")
 }
 

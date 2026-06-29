@@ -119,10 +119,16 @@ nomad-csi-driver run \
   --mode            {controller|node|monolith} \
   --driver          {qnap|local} \
   --endpoint        unix:///csi/csi.sock     # or $CSI_ENDPOINT
-  --node-id         ${node.unique.id}        # node/monolith modes; or $CSI_NODE_ID
+  --node-id         ${node.unique.name}      # required (all modes); or $CSI_NODE_ID
+  --plugin-id       ${var.plugin_id}         # required; or $CSI_PLUGIN_ID (matches csi_plugin.id)
   --parent-dataset  nomad-csi                # --driver=local only; ZFS parent dataset (see below)
   --config          /local/config.hcl
 ```
+
+`--node-id` and `--plugin-id` are **required in every mode** (controller included)
+and become metric labels (see Observability). `--plugin-id` should match the Nomad
+`csi_plugin { id = … }` for this deployment; `--node-id` is conventionally
+`${node.unique.name}`.
 
 - `qnap`: a process is `controller` (one per cluster/DC, sole talker to the
   appliance) **xor** `node` (every client; iSCSI + multipath + format/mount).
@@ -293,20 +299,29 @@ so scrape **every** controller and node alloc. Co-located processes must use
 **different ports** (host networking shares the port space) — hence qnap controller
 `:9501`, qnap node `:9502`, local monolith `:9503`.
 
-**Scrape labels (deployment identity):** `plugin_id`, `role` (controller/node),
-and `nomad_node` are **not** encoded in metric names — each process exposes only
-its own series, so attach identity at **scrape time** via relabeling (Nomad
-service-discovery / `__meta_nomad_*` target labels, or Consul SD tags if the
-cluster runs Consul). This keeps metrics driver-generic and lets multiple
-deployments of the same driver (e.g. `qnap-sanA` / `qnap-sanB`) be distinguished
-by label with no code change.
+**Deployment-identity labels (baked in).** Every series — including `go_*` /
+`process_*` — carries four constant labels identifying the emitting deployment:
+`driver` (the `--driver` value), `mode` (`--mode`: controller/node/monolith),
+`node_id` (`--node-id`), and `plugin_id` (`--plugin-id`). A
+`nomad_csi_build_info{version,commit,build_date} 1` gauge carries the build stamp
+alongside those constants, so a bare scrape (or `curl`) is self-describing and
+identifies which process/listener served it — no relabeling required. (This
+intentionally reverses an earlier "identity as scrape-relabel only" posture:
+identity is intrinsic to the process, so it is self-reported. Multiple deployments
+of the same driver — e.g. `qnap-sanA` / `qnap-sanB` — are still distinguished, now
+by their `plugin_id`.) `nomad_node` and any extra SD metadata can still be attached
+at scrape time via relabeling.
 
 **Metrics exposed:**
 
+> All metrics below also carry the constant `driver`, `mode`, `node_id`, and
+> `plugin_id` labels described above; only each metric's **own** labels are listed.
+
 | Metric | Labels | Where | Meaning |
 | --- | --- | --- | --- |
-| `nomad_csi_rpc_total` (counter) | `driver,method,code` | controller + node | CSI RPCs by method and gRPC code |
-| `nomad_csi_rpc_duration_seconds` (histogram) | `driver,method,code` | controller + node | CSI RPC latency |
+| `nomad_csi_build_info` (gauge) | `version,commit,build_date` | all | Build/deployment identity; always 1 (carries the constant identity labels) |
+| `nomad_csi_rpc_total` (counter) | `method,code` | controller + node | CSI RPCs by method and gRPC code |
+| `nomad_csi_rpc_duration_seconds` (histogram) | `method,code` | controller + node | CSI RPC latency |
 | `nomad_csi_node_mount_total` (counter) | `op,outcome` | node | Mount-layer ops (format/mount/unmount/bind/resize) by outcome |
 | `nomad_csi_node_mount_duration_seconds` (histogram) | `op` | node | Mount-layer op latency |
 | `nomad_csi_node_format_skipped_total` (counter) | — | node | Existing-filesystem reuse (idempotent format skip) |
@@ -319,20 +334,22 @@ by label with no code change.
 | `nomad_csi_qnap_iscsi_rescan_total` / `nomad_csi_qnap_device_wait_total` (counters) | `outcome` | qnap node | Expand rescan / device-appearance waits |
 | `nomad_csi_local_zfs_op_total` (counter) | `op,outcome` | local | ZFS logical ops (create/clone/destroy/expand/snapshot/list) by outcome |
 | `nomad_csi_local_zfs_op_duration_seconds` (histogram) | `op` | local | ZFS op latency |
-| `nomad_csi_local_forward_total` (counter) | `method,outcome` | local | Controller→controller forwards (ok/error/unreachable) |
-| `nomad_csi_local_peer_resolve_total` (counter) | `outcome` | local | Peer-roster resolutions |
-| `nomad_csi_local_placement_total` (counter) | `mode,outcome` | local | Volume placements by mode (content/host/auto) |
+| `nomad_csi_local_placement_total` (counter) | `strategy,outcome` | local | Volume placements by strategy (content/host/auto) |
 | `nomad_csi_local_capacity_reject_total` (counter) | — | local | Creates refused for dropping below pool reserve |
-| `nomad_csi_local_peers` (gauge) | — | local | Peer controllers discovered at last resolve |
 | `nomad_csi_local_pool_*` (gauges) | `pool` | local | Pool online/free/avail bytes + zvol count (computed at scrape) |
+| `nomad_csi_cluster_forward_total` (counter) | `method,outcome` | controller (local + qnap) | Forwards by method (ok/error/unreachable): local controller→controller, qnap controller→node fan-out |
+| `nomad_csi_cluster_resolve_total` (counter) | `outcome` | controller (local + qnap) | Peer/node roster resolutions |
+| `nomad_csi_cluster_peers` (gauge) | — | controller (local + qnap) | Cluster members discovered at last resolve (local: peer controllers; qnap: node daemons) |
 | `go_*`, `process_*` | — | all | Go runtime + process collectors |
 
 Every CSI RPC is instrumented via a shared gRPC interceptor, so both `--driver=qnap`
-and `--driver=local` emit the `nomad_csi_rpc_*` families (label `driver=qnap|local`);
-the `nomad_csi_qnap_*` families appear only on the qnap processes and the
-`nomad_csi_local_*` families only on the local monolith. The `nomad_csi_node_*`
-families are shared by both backends' node side. Pool gauges are computed lazily by
-a scrape-time collector (no background poller, no extra load on the SAN).
+and `--driver=local` emit the `nomad_csi_rpc_*` families (the backend is the constant
+`driver` label, not part of each series' own labels). The `nomad_csi_qnap_*` families
+appear only on the qnap processes and the `nomad_csi_local_*` families only on the
+local monolith. The `nomad_csi_node_*` families are shared by both backends' node
+side, and the `nomad_csi_cluster_*` forwarding families are shared by both backends'
+controller role. Pool gauges are computed lazily by a scrape-time collector (no
+background poller, no extra load on the SAN).
 
 The `make test-integration` suite scrapes the live endpoints and asserts the
 gauges/counters move across a real create→mount→unmount→delete cycle (plus a

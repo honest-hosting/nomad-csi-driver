@@ -30,7 +30,7 @@ type testClients struct {
 func newTestClients(t *testing.T, b driver.Backend, mode driver.Mode) testClients {
 	t.Helper()
 	lis := bufconn.Listen(1 << 20)
-	gs, err := newGRPCServer(b, mode, zap.NewNop(), metrics.New("test"))
+	gs, err := newGRPCServer(b, mode, zap.NewNop(), metrics.New("test", "monolith", "node-test", "plugin-test"))
 	require.NoError(t, err)
 
 	go func() { _ = gs.Serve(lis) }()

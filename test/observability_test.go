@@ -69,7 +69,7 @@ func TestIntegration_Observability_Local(t *testing.T) {
 	for _, fam := range []string{
 		"nomad_csi_rpc_total",
 		"nomad_csi_node_staged_volumes",
-		"nomad_csi_local_peers",
+		"nomad_csi_cluster_peers",
 	} {
 		require.True(t, hasFamily(probe, fam), "metric family %q missing from %s:%s%s", fam, hosts[0], port, path)
 	}

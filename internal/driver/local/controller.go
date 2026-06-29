@@ -13,6 +13,7 @@ import (
 	"github.com/honest-hosting/nomad-csi-driver/internal/cluster"
 	"github.com/honest-hosting/nomad-csi-driver/internal/config"
 	"github.com/honest-hosting/nomad-csi-driver/internal/driver"
+	"github.com/honest-hosting/nomad-csi-driver/internal/metrics"
 	"github.com/honest-hosting/nomad-csi-driver/internal/stats"
 	"github.com/honest-hosting/nomad-csi-driver/internal/zfs"
 )
@@ -31,6 +32,9 @@ type controller struct {
 	log           *zap.Logger
 	// metrics is optional (nil in tests / node-only); observeZFS is nil-safe.
 	metrics *localMetrics
+	// cluster holds the shared forwarding/resolution metrics (nil-safe); reached
+	// via recordForward/recordResolve and listPeers.
+	cluster *metrics.ClusterMetrics
 	// statsReg is the node-side per-volume usage cache (nil-safe). The controller
 	// reads it for co-located volumes and forwards to the owner otherwise.
 	statsReg *stats.Registry
@@ -468,8 +472,8 @@ func forwardOutcome(err error) string {
 func (c *controller) listPeers(ctx context.Context) ([]cluster.NodeInfo, error) {
 	peers, err := c.res.List(ctx)
 	c.recordResolve(err)
-	if err == nil && c.metrics != nil {
-		c.metrics.peers.Set(float64(len(peers)))
+	if err == nil {
+		c.cluster.SetPeers(len(peers))
 	}
 	return peers, err
 }

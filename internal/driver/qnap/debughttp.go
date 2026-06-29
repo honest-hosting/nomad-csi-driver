@@ -20,7 +20,7 @@ const qnapClientTimeout = 30 * time.Second
 // every raw request path + response body is logged at debug level — the
 // in-driver equivalent of `qnapctl --debug-http`, usable from a Nomad job by
 // setting `qnap { debug_http = true }` and running with --log-level=debug.
-func newQNAPClient(cfg *config.QNAPConfig, reg *prometheus.Registry, log *zap.Logger) (*goqnap.Client, error) {
+func newQNAPClient(cfg *config.QNAPConfig, reg prometheus.Registerer, log *zap.Logger) (*goqnap.Client, error) {
 	opts := []goqnap.Option{
 		goqnap.WithHooks(qnapHooks(reg, log)),
 	}

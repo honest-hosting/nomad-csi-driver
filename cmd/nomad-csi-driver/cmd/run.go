@@ -31,6 +31,7 @@ var runFlags struct {
 	driver        string
 	endpoint      string
 	nodeID        string
+	pluginID      string
 	parentDataset string
 	config        string
 	logLevel      string
@@ -55,7 +56,8 @@ func init() {
 	f.StringVar(&runFlags.mode, "mode", "", "process role: controller|node|monolith")
 	f.StringVar(&runFlags.driver, "driver", "", "storage backend: qnap|local")
 	f.StringVar(&runFlags.endpoint, "endpoint", envOr("CSI_ENDPOINT", ""), "CSI Unix socket endpoint (unix://...); defaults to $CSI_ENDPOINT")
-	f.StringVar(&runFlags.nodeID, "node-id", envOr("CSI_NODE_ID", ""), "this node's unique ID (e.g. ${node.unique.id}); defaults to $CSI_NODE_ID")
+	f.StringVar(&runFlags.nodeID, "node-id", envOr("CSI_NODE_ID", ""), "this node's unique ID (e.g. ${node.unique.name}); defaults to $CSI_NODE_ID; required in all modes (also a metric label)")
+	f.StringVar(&runFlags.pluginID, "plugin-id", envOr("CSI_PLUGIN_ID", ""), "the Nomad csi_plugin id this deployment runs as (e.g. ${var.plugin_id}); defaults to $CSI_PLUGIN_ID; required (also a metric label)")
 	f.StringVar(&runFlags.parentDataset, "parent-dataset", defaultParentDataset, "(--driver=local) ZFS dataset under each pool that holds provisioned zvols: <pool>/<parent-dataset>/<volume-id>. A pool's parent_dataset config overrides it. Set to your csi_plugin id (e.g. --parent-dataset=${var.plugin_id}) to namespace per deployment")
 	f.StringVar(&runFlags.config, "config", "", "path to the deployment config file (HCL or JSON)")
 	f.StringVar(&runFlags.logLevel, "log-level", "info", "log level: debug|info|warn|error")
@@ -73,8 +75,11 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	if err := driver.ValidateModeForDriver(runFlags.driver, mode); err != nil {
 		return err
 	}
-	if mode.HasNode() && runFlags.nodeID == "" {
-		return fmt.Errorf("--node-id (or $CSI_NODE_ID) is required for node/monolith mode")
+	if runFlags.nodeID == "" {
+		return fmt.Errorf("--node-id (or $CSI_NODE_ID) is required")
+	}
+	if runFlags.pluginID == "" {
+		return fmt.Errorf("--plugin-id (or $CSI_PLUGIN_ID) is required")
 	}
 
 	log, err := buildLogger(runFlags.logLevel, runFlags.logFormat)
@@ -95,7 +100,7 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	m := metrics.New(runFlags.driver)
+	m := metrics.New(runFlags.driver, string(mode), runFlags.nodeID, runFlags.pluginID)
 
 	backend, err := driver.New(ctx, runFlags.driver, driver.Deps{
 		Mode:          mode,

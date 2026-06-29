@@ -108,17 +108,17 @@ func parentDatasetForPool(cfg *config.LocalConfig, pool, defaultParent string) s
 // localMetrics holds the --driver=local domain collectors, registered on the
 // shared registry in backend.New and threaded into the controller. The ZFS
 // wrapper stays metrics-free; counting happens at the logical-op boundary here.
+// Forwarding/resolution collectors moved to the shared metrics.ClusterMetrics
+// (cluster_* subsystem), reached via the controller's cluster field, so both
+// backends share that path now.
 type localMetrics struct {
 	zfsOpTotal     *prometheus.CounterVec   // {op, outcome}
 	zfsOpDuration  *prometheus.HistogramVec // {op}
-	forwardTotal   *prometheus.CounterVec   // {method, outcome=ok|error|unreachable}
-	resolveTotal   *prometheus.CounterVec   // {outcome=ok|error}
-	placementTotal *prometheus.CounterVec   // {mode=content|host|auto, outcome=ok|error}
+	placementTotal *prometheus.CounterVec   // {strategy=content|host|auto, outcome=ok|error}
 	capacityReject prometheus.Counter
-	peers          prometheus.Gauge // discovered peers (last successful resolve)
 }
 
-func newLocalMetrics(reg *prometheus.Registry) *localMetrics {
+func newLocalMetrics(reg prometheus.Registerer) *localMetrics {
 	m := &localMetrics{
 		zfsOpTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "nomad_csi", Subsystem: "local", Name: "zfs_op_total",
@@ -128,46 +128,26 @@ func newLocalMetrics(reg *prometheus.Registry) *localMetrics {
 			Namespace: "nomad_csi", Subsystem: "local", Name: "zfs_op_duration_seconds",
 			Help: "Local ZFS logical operation duration by op.", Buckets: prometheus.DefBuckets,
 		}, []string{"op"}),
-		forwardTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "nomad_csi", Subsystem: "local", Name: "forward_total",
-			Help: "Controller→controller forwards by method and outcome (ok|error|unreachable).",
-		}, []string{"method", "outcome"}),
-		resolveTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "nomad_csi", Subsystem: "local", Name: "peer_resolve_total",
-			Help: "Peer-roster resolutions by outcome (ok|error).",
-		}, []string{"outcome"}),
 		placementTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "nomad_csi", Subsystem: "local", Name: "placement_total",
-			Help: "Volume placements by mode (content|host|auto) and outcome (ok|error).",
-		}, []string{"mode", "outcome"}),
+			Help: "Volume placements by strategy (content|host|auto) and outcome (ok|error). 'strategy' was renamed from 'mode' to free the deployment-identity 'mode' label.",
+		}, []string{"strategy", "outcome"}),
 		capacityReject: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: "nomad_csi", Subsystem: "local", Name: "capacity_reject_total",
 			Help: "Creates refused because the pool would drop below its reserve.",
 		}),
-		peers: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: "nomad_csi", Subsystem: "local", Name: "peers",
-			Help: "Peer controllers discovered at the last successful resolve.",
-		}),
 	}
-	reg.MustRegister(m.zfsOpTotal, m.zfsOpDuration, m.forwardTotal, m.resolveTotal, m.placementTotal, m.capacityReject, m.peers)
+	reg.MustRegister(m.zfsOpTotal, m.zfsOpDuration, m.placementTotal, m.capacityReject)
 	return m
 }
 
+// recordForward / recordResolve delegate to the shared cluster metrics (nil-safe).
 func (c *controller) recordForward(method, outcome string) {
-	if c.metrics != nil {
-		c.metrics.forwardTotal.WithLabelValues(method, outcome).Inc()
-	}
+	c.cluster.Forward(method, outcome)
 }
 
 func (c *controller) recordResolve(err error) {
-	if c.metrics == nil {
-		return
-	}
-	outcome := "ok"
-	if err != nil {
-		outcome = "error"
-	}
-	c.metrics.resolveTotal.WithLabelValues(outcome).Inc()
+	c.cluster.Resolve(err)
 }
 
 func (c *controller) recordPlacement(mode string, err error) {

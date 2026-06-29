@@ -69,7 +69,7 @@ func TestQNAPSource_FanOutAggregates(t *testing.T) {
 	}}
 	// "vol-c" is registered in Nomad (mapper resolves it) but no node serves it.
 	mapper := fakeMapper{fwd: map[string]string{"vol-a": extA, "vol-b": extB, "vol-c": "qnap/v1/9/9/t/vol-c"}}
-	src := newQNAPSource(res, cluster.NewClient(secret), mapper, "default", 30*time.Millisecond, zap.NewNop())
+	src := newQNAPSource(res, cluster.NewClient(secret), mapper, "default", 30*time.Millisecond, nil, zap.NewNop())
 	t.Cleanup(src.Close)
 
 	waitFor(t, 2*time.Second, func() bool {

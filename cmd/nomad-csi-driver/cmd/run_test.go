@@ -85,7 +85,7 @@ func TestAwaitBackendReady(t *testing.T) {
 // startMetricsServer must be OFF unless explicitly enabled, and serve on the
 // configured (or default) address when enabled.
 func TestStartMetricsServer_Gating(t *testing.T) {
-	m := metrics.New("test")
+	m := metrics.New("test", "monolith", "node-test", "plugin-test")
 	log := zap.NewNop()
 
 	// No metrics block → off.
