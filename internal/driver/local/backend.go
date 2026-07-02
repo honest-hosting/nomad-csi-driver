@@ -143,19 +143,29 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 		},
 		ctrl: ctrl,
 		nd: &node{
-			cfg:         cfg,
-			z:           z,
-			nodeID:      d.NodeID,
-			mounter:     mountutil.New(d.Runner, log).WithMetrics(nm),
-			log:         log,
-			nodeM:       nm,
-			stats:       statsReg,
-			waitForPath: osWaitForPath(devAppearTimeout),
+			cfg:           cfg,
+			z:             z,
+			nodeID:        d.NodeID,
+			parentDataset: parentDataset,
+			mounter:       mountutil.New(d.Runner, log).WithMetrics(nm),
+			log:           log,
+			stats:         statsReg,
+			waitForPath:   osWaitForPath(devAppearTimeout),
 		},
 		z:        z,
 		cfg:      cfg,
 		statsReg: statsReg,
 		log:      log,
+	}
+	b.nd.zvolDevices = b.nd.osZvolDevices // read our zvol device set from /dev/zvol
+
+	// node_staged_volumes: a GaugeFunc that counts this node's staged zvols from
+	// the live mount table on each scrape (host truth, so correct across restarts
+	// and never negative).
+	if d.Metrics != nil {
+		if err := metrics.RegisterStagedGauge(d.Metrics.Registerer(), b.nd, log); err != nil {
+			return nil, driver.Internal("registering staged-volumes gauge: %v", err)
+		}
 	}
 
 	// Start the forwarding server so peers can route owner-node operations here.

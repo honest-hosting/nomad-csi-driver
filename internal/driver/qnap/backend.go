@@ -38,7 +38,6 @@ func init() { driver.Register("qnap", New) }
 
 const (
 	pluginName         = "io.honesthosting.csi.qnap"
-	defaultStateDir    = "/var/lib/nomad-csi-driver/qnap"
 	devAppearTimeout   = 60 * time.Second
 	defaultForwardAddr = ":9602"
 )
@@ -52,6 +51,7 @@ type backend struct {
 	forwardSrv *http.Server       // node-side stats forwarding server
 	source     *qnapSource        // controller-side fan-out aggregate
 	queryS     *stats.QueryServer // controller-side public query API
+	stopRecon  context.CancelFunc // stops the node session reconciler; nil for controller-only
 	log        *zap.Logger
 }
 
@@ -106,10 +106,6 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 	}
 
 	if d.Mode.HasNode() {
-		stateDir := cfg.NodeStateDir
-		if stateDir == "" {
-			stateDir = defaultStateDir
-		}
 		mpath := multipath.New(d.Runner, cfg.MultipathConfigDir)
 		var qnm *qnapNodeMetrics
 		if d.Metrics != nil {
@@ -123,16 +119,41 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 			iscsi:        iscsi.New(d.Runner),
 			mpath:        mpath,
 			mounter:      mountutil.New(d.Runner, log).WithMetrics(nm),
-			meta:         newFileMetaStore(stateDir),
+			meta:         newMemMetaStore(), // tier-1 in-memory identity cache; no durable state
 			useMultipath: !cfg.DisableMultipath,
 			log:          log,
 			metrics:      qnm,
-			nodeM:        nm,
 			stats:        b.statsReg,
+			san:          newNodeSANCache(cfg, d, log), // tier-3 cold-block identity; nil when no SAN creds
+			holdersFn:    deviceHasHolders,
 			waitForPath:  osWaitForPath(devAppearTimeout),
 		}
 		if b.nd.useMultipath {
 			b.installMultipathDropin(context.Background(), mpath)
+		}
+		// node_staged_volumes: a GaugeFunc counting this node's staged LUNs from
+		// live iSCSI sessions on each scrape (host truth; correct across restarts,
+		// never negative). Node-only/monolith register it; controller-only has no
+		// node and stages nothing.
+		if d.Metrics != nil {
+			if err := metrics.RegisterStagedGauge(d.Metrics.Registerer(), b.nd, log); err != nil {
+				return nil, driver.Internal("registering staged-volumes gauge: %v", err)
+			}
+		}
+
+		// Session reconciler (data safety): logs out leaked iSCSI targets so a
+		// stale session can't let a second node also write the LUN (split-brain).
+		// OFF by default — it actively logs sessions out, so enable it deliberately
+		// (qnap.reconcile_enabled = true) after validating on the fleet.
+		if reconcileEnabled(cfg) {
+			interval, grace := reconcileTimings(cfg, log)
+			reconCtx, cancel := context.WithCancel(context.Background())
+			b.stopRecon = cancel
+			go newReconciler(b.nd, interval, grace).Run(reconCtx)
+			log.Info("qnap node session reconciler enabled",
+				zap.Duration("interval", interval), zap.Duration("grace", grace))
+		} else {
+			log.Info("qnap node session reconciler disabled (set qnap.reconcile_enabled = true to enable leaked-session cleanup)")
 		}
 	}
 
@@ -223,6 +244,9 @@ func (b *backend) Capabilities() driver.Capabilities { return b.caps }
 // non-blocking and nil-safe (controller-only / node-only processes skip the
 // halves they never built).
 func (b *backend) Shutdown(ctx context.Context) error {
+	if b.stopRecon != nil {
+		b.stopRecon()
+	}
 	b.statsReg.Close()
 	b.source.Close()
 	if b.queryS != nil {
@@ -271,6 +295,54 @@ func (b *backend) installMultipathDropin(ctx context.Context, m *multipath.Manag
 	if err := m.Reload(ctx); err != nil {
 		b.log.Warn("reloading multipathd", zap.Error(err))
 	}
+}
+
+// newNodeSANCache builds the node's read-only SAN identity resolver used for
+// cold-cache block-volume teardown (tier 3). It requires SAN credentials in the
+// node config (OQ5); without them it returns nil and block teardown degrades
+// open (fs and warm-cache paths are unaffected — they never touch the SAN).
+func newNodeSANCache(cfg *config.QNAPConfig, d driver.Deps, log *zap.Logger) *sanIdentityCache {
+	if cfg.BaseURL == "" || cfg.Username == "" || cfg.Password == "" {
+		log.Info("qnap node: no SAN credentials; cold-cache block-volume teardown will degrade open (fs/warm paths unaffected)")
+		return nil
+	}
+	reg := prometheus.Registerer(prometheus.NewRegistry())
+	if d.Metrics != nil {
+		reg = d.Metrics.Registerer()
+	}
+	cl, err := newQNAPClient(cfg, reg, log)
+	if err != nil {
+		log.Warn("qnap node: failed to build read-only SAN client; block teardown will degrade open", zap.Error(err))
+		return nil
+	}
+	return newSANIdentityCache(cl, newSessionManager(cl, cfg.Username, cfg.Password), sanIdentityCacheTTL, log)
+}
+
+// reconcileEnabled reports whether the node session reconciler is turned on
+// (default off — nil pointer).
+func reconcileEnabled(cfg *config.QNAPConfig) bool {
+	return cfg.ReconcileEnabled != nil && *cfg.ReconcileEnabled
+}
+
+// reconcileTimings resolves the reconciler sweep interval and orphan grace from
+// config, falling back to the defaults on an empty or unparseable value.
+func reconcileTimings(cfg *config.QNAPConfig, log *zap.Logger) (interval, grace time.Duration) {
+	interval, grace = defaultReconcileInterval, defaultReconcileGrace
+	if cfg.ReconcileInterval != "" {
+		if d, err := time.ParseDuration(cfg.ReconcileInterval); err == nil {
+			interval = d
+		} else {
+			log.Warn("qnap: invalid reconcile_interval; using default", zap.String("value", cfg.ReconcileInterval), zap.Duration("default", interval))
+		}
+	}
+	if cfg.ReconcileGrace != "" {
+		if d, err := time.ParseDuration(cfg.ReconcileGrace); err == nil {
+			grace = d
+		} else {
+			log.Warn("qnap: invalid reconcile_grace; using default", zap.String("value", cfg.ReconcileGrace), zap.Duration("default", grace))
+		}
+	}
+	return interval, grace
 }
 
 func validateControllerConfig(cfg *config.QNAPConfig) error {

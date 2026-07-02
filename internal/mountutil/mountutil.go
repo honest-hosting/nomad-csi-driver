@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -244,6 +245,72 @@ func (m *Mounter) IsMounted(ctx context.Context, target string) (bool, error) {
 		return false, fmt.Errorf("findmnt %s: %w", target, err)
 	}
 	return strings.TrimSpace(string(out.Stdout)) == target, nil
+}
+
+// Mount is one entry of the mount table: what is mounted (Source, e.g. a device
+// or a bind source) and where (Target). Populated by ListMounts.
+type Mount struct {
+	Target string
+	Source string
+}
+
+// ListMounts returns every mount currently visible to this process, via
+// `findmnt -rn -o TARGET,SOURCE`. Used to count staged volumes (source under the
+// zvol root) and to correlate staging paths/devices during teardown. An empty
+// table (findmnt exit 1) yields an empty slice, not an error.
+func (m *Mounter) ListMounts(ctx context.Context) ([]Mount, error) {
+	out, err := m.run.Run(ctx, cexec.Command{
+		Name: "findmnt",
+		Args: []string{"-rn", "-o", "TARGET,SOURCE"},
+	})
+	if err != nil {
+		if cexec.IsExit(err, 1) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("findmnt list: %w", err)
+	}
+	return parseMounts(string(out.Stdout)), nil
+}
+
+// parseMounts parses `findmnt -r` output: one mount per line, two columns
+// separated by a single space, with unsafe characters (including spaces) hex-
+// escaped as \xNN — so exactly one literal space separates TARGET from SOURCE.
+func parseMounts(text string) []Mount {
+	var out []Mount
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.SplitN(line, " ", 2)
+		mt := Mount{Target: unescapeRaw(fields[0])}
+		if len(fields) == 2 {
+			mt.Source = unescapeRaw(strings.TrimSpace(fields[1]))
+		}
+		out = append(out, mt)
+	}
+	return out
+}
+
+// unescapeRaw decodes findmnt raw-mode \xNN hex escapes (e.g. "\x20" → " ").
+// Unrecognized backslash sequences are left verbatim.
+func unescapeRaw(s string) string {
+	if !strings.Contains(s, `\x`) {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if i+3 < len(s) && s[i] == '\\' && s[i+1] == 'x' {
+			if v, err := strconv.ParseUint(s[i+2:i+4], 16, 8); err == nil {
+				b.WriteByte(byte(v))
+				i += 4
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
 }
 
 // Resize grows the filesystem on a device after the underlying block device has

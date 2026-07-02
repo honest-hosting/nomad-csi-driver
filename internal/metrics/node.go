@@ -14,7 +14,6 @@ type NodeMetrics struct {
 	mountTotal    *prometheus.CounterVec   // {op, outcome}
 	mountDuration *prometheus.HistogramVec // {op}
 	formatSkipped prometheus.Counter
-	staged        prometheus.Gauge // volumes currently staged on this node
 }
 
 // NewNodeMetrics registers the node collectors on reg (the identity-wrapping
@@ -33,12 +32,8 @@ func NewNodeMetrics(reg prometheus.Registerer) *NodeMetrics {
 			Namespace: "nomad_csi", Subsystem: "node", Name: "format_skipped_total",
 			Help: "Times an existing filesystem was found and mkfs was skipped (idempotency safety signal).",
 		}),
-		staged: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: "nomad_csi", Subsystem: "node", Name: "staged_volumes",
-			Help: "Volumes currently staged (mounted) on this node.",
-		}),
 	}
-	reg.MustRegister(m.mountTotal, m.mountDuration, m.formatSkipped, m.staged)
+	reg.MustRegister(m.mountTotal, m.mountDuration, m.formatSkipped)
 	return m
 }
 
@@ -61,16 +56,7 @@ func (m *NodeMetrics) FormatSkipped() {
 	}
 }
 
-// StagedInc records a volume becoming staged (mounted) on this node.
-func (m *NodeMetrics) StagedInc() {
-	if m != nil {
-		m.staged.Inc()
-	}
-}
-
-// StagedDec records a volume being unstaged from this node.
-func (m *NodeMetrics) StagedDec() {
-	if m != nil {
-		m.staged.Dec()
-	}
-}
+// NOTE: the staged-volume count is no longer an Inc/Dec gauge here. It is
+// derived from live host state at scrape time via metrics.RegisterStagedGauge +
+// each backend's StagedCounter, so it survives plugin restarts and can never go
+// negative. See internal/metrics/staged.go.

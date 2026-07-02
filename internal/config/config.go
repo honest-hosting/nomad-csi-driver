@@ -53,10 +53,23 @@ type QNAPConfig struct {
 	DisableMultipath bool `hcl:"disable_multipath,optional"`
 	// MultipathConfigDir overrides the multipath drop-in directory.
 	MultipathConfigDir string `hcl:"multipath_config_dir,optional"`
-	// NodeStateDir holds per-volume stage metadata the node writes at
-	// NodeStageVolume and reads at NodeUnstageVolume (which carries no volume
-	// context). Defaults to /var/lib/nomad-csi-driver/qnap.
+	// NodeStateDir is DEPRECATED and ignored. The node no longer persists stage
+	// metadata to disk: teardown identity is held in an in-memory cache and
+	// reconstructed from host/SAN state after a restart (zero durable storage).
+	// The field is retained so existing configs still parse.
 	NodeStateDir string `hcl:"node_state_dir,optional"`
+
+	// ReconcileEnabled turns on the node session reconciler (qnap node only): a
+	// periodic sweep that logs out leaked iSCSI target sessions to prevent
+	// split-brain. Default OFF — enable deliberately after validating on the fleet
+	// (it actively logs sessions out, so a liveness misjudgment could disrupt a
+	// running volume).
+	ReconcileEnabled *bool `hcl:"reconcile_enabled,optional"`
+	// ReconcileInterval is the sweep cadence (default 2m); ReconcileGrace is how
+	// long a target must look orphaned across sweeps before logout (default 5m).
+	// Go duration strings; invalid values fall back to the defaults.
+	ReconcileInterval string `hcl:"reconcile_interval,optional"`
+	ReconcileGrace    string `hcl:"reconcile_grace,optional"`
 	// DebugHTTP wraps the QNAP transport to log every raw request path +
 	// response body at debug level (the in-driver equivalent of
 	// `qnapctl --debug-http`). Verbose and may include appliance data — enable

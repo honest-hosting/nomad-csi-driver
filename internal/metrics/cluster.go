@@ -69,6 +69,7 @@ func (m *ClusterMetrics) ForwardCounter(method, outcome string) prometheus.Count
 	return m.forwardTotal.WithLabelValues(method, outcome)
 }
 
+// ResolveCounter exposes the roster-resolution child counter (see ForwardCounter).
 func (m *ClusterMetrics) ResolveCounter(outcome string) prometheus.Counter {
 	return m.resolveTotal.WithLabelValues(outcome)
 }

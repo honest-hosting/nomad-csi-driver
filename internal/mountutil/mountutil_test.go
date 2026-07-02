@@ -194,3 +194,55 @@ func TestResize(t *testing.T) {
 		assert.Equal(t, []string{"xfs_growfs /mnt/x"}, fr.Commands())
 	})
 }
+
+// findmntRaw is a realistic `findmnt -rn -o TARGET,SOURCE` capture: root fs, a
+// zvol staging mount, its publish bind-mount (source = the staging dir, not the
+// zvol — so the volume is counted once), and a foreign qnap /dev/mapper mount.
+const findmntRaw = `/ /dev/vda1
+/boot /dev/vda2
+/opt/nomad/client/csi/node/wp1-ncdl/staging/vol-a/rw-file-system /dev/zvol/tank/nomad-csi/vol-a
+/opt/nomad/client/csi/node/wp1-ncdl/per-alloc/abc/vol-a/rw /opt/nomad/client/csi/node/wp1-ncdl/staging/vol-a/rw-file-system
+/opt/nomad/client/csi/node/wp1-ncdq/staging/vol-q/rw-file-system /dev/mapper/36001405deadbeef
+`
+
+func TestListMounts(t *testing.T) {
+	fr := runnerFor(map[string]cmdResult{"findmnt": {stdout: findmntRaw}})
+	mounts, err := New(fr, nil).ListMounts(ctx())
+	require.NoError(t, err)
+	require.Len(t, mounts, 5)
+	assert.Equal(t, Mount{Target: "/", Source: "/dev/vda1"}, mounts[0])
+	assert.Equal(t, "/dev/zvol/tank/nomad-csi/vol-a", mounts[2].Source)
+
+	// A caller counting this plugin's staged zvols keys off the /dev/zvol source;
+	// the bind-mount's source is the staging dir, so each volume appears once.
+	zvols := 0
+	for _, m := range mounts {
+		if strings.HasPrefix(m.Source, "/dev/zvol/tank/nomad-csi/") {
+			zvols++
+		}
+	}
+	assert.Equal(t, 1, zvols)
+
+	assert.Equal(t, []string{"findmnt -rn -o TARGET,SOURCE"}, fr.Commands())
+}
+
+func TestListMountsEmptyOnExit1(t *testing.T) {
+	fr := runnerFor(map[string]cmdResult{"findmnt": {err: &cexec.Error{Name: "findmnt", ExitCode: 1}}})
+	mounts, err := New(fr, nil).ListMounts(ctx())
+	require.NoError(t, err)
+	assert.Empty(t, mounts)
+}
+
+func TestListMountsError(t *testing.T) {
+	fr := runnerFor(map[string]cmdResult{"findmnt": {err: &cexec.Error{Name: "findmnt", ExitCode: 127}}})
+	_, err := New(fr, nil).ListMounts(ctx())
+	require.Error(t, err)
+}
+
+func TestParseMountsUnescapesSpaces(t *testing.T) {
+	// findmnt raw mode hex-escapes spaces in paths as \x20.
+	got := parseMounts(`/mnt/with\x20space /dev/sdz`)
+	require.Len(t, got, 1)
+	assert.Equal(t, "/mnt/with space", got[0].Target)
+	assert.Equal(t, "/dev/sdz", got[0].Source)
+}

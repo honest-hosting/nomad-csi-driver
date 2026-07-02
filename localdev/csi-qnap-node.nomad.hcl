@@ -80,6 +80,12 @@ qnap {
   # per-volume readings. Port :9612 is distinct from the local backend's :9602.
   forward_secret = "${var.forward_secret}"
   forward_addr   = ":9612"
+
+  # Session reconciler (leaked-iSCSI-session / split-brain cleanup). OFF by
+  # default in production; enabled here for e2e validation with a short grace
+  # (production default is 5m) so the sweep→logout path is exercised in-suite.
+  reconcile_enabled = true
+  reconcile_grace   = "2m"
 }
 %{ if var.metrics_enabled ~}
 metrics {
