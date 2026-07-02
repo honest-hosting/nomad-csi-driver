@@ -131,6 +131,28 @@ func (m *Manager) MapWWID(ctx context.Context, device string) (string, error) {
 	return "", nil
 }
 
+// Members returns the path devices (bare names, e.g. "sdg") that belong to the
+// map with the given WWID, as multipathd reports them. Used at teardown to map a
+// /dev/mapper/<wwid> device back to the iSCSI sessions of its member paths.
+// Returns an empty slice (nil error) when the map has no paths.
+func (m *Manager) Members(ctx context.Context, wwid string) ([]string, error) {
+	out, err := m.run.Run(ctx, cexec.Command{
+		Name: "multipathd",
+		Args: []string{"show", "paths", "format", "%d %w"},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("multipathd show paths: %w", err)
+	}
+	var devs []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out.Stdout)), "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 2 && f[1] == wwid {
+			devs = append(devs, f[0])
+		}
+	}
+	return devs, nil
+}
+
 // Flush removes the multipath map for a WWID on teardown. It is best-effort:
 // "map in use" is surfaced so the caller can decide.
 func (m *Manager) Flush(ctx context.Context, wwid string) error {

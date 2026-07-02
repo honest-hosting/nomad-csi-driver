@@ -89,7 +89,7 @@ release-preflight:
 	@git rev-parse "$(TAG)" >/dev/null 2>&1 && (echo "ERROR: tag $(TAG) already exists locally" && exit 1) || true
 .PHONY: release-preflight
 
-clean: ## Remove built artifacts
+clean: test-integration-teardown ## Remove built artifacts
 	@rm -f ./bin/nomad-csi-driver ./bin/nomad-csi-driver.sha256
 .PHONY: clean
 
@@ -132,7 +132,7 @@ test-integration-deploy: ## Deploy the CSI plugin jobs (local + qnap) to NOMAD_A
 	@bash localdev/deploy.sh
 .PHONY: test-integration-deploy
 
-test-integration-teardown: ## Purge the CSI plugin jobs + e2e volumes/consumers from NOMAD_ADDR
+test-integration-teardown: test-integration-preflight ## Purge the CSI plugin jobs + e2e volumes/consumers from NOMAD_ADDR
 	@bash localdev/teardown.sh
 .PHONY: test-integration-teardown
 

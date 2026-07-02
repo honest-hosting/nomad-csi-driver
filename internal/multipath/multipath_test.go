@@ -66,3 +66,21 @@ func TestMapWWID(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, none)
 }
+
+func TestMembers(t *testing.T) {
+	fr := &cexec.FakeRunner{Responder: func(c cexec.Command) (cexec.Output, error) {
+		if c.Name == "multipathd" {
+			return cexec.Output{Stdout: []byte("sda wwidA\nsdb wwidB\nsdc wwidA\n")}, nil
+		}
+		return cexec.Output{}, nil
+	}}
+	m := New(fr, t.TempDir())
+
+	got, err := m.Members(context.Background(), "wwidA")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"sda", "sdc"}, got, "both path devices of wwidA, not wwidB")
+
+	none, err := m.Members(context.Background(), "nope")
+	require.NoError(t, err)
+	assert.Empty(t, none)
+}

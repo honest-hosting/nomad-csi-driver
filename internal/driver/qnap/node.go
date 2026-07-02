@@ -2,7 +2,10 @@ package qnap
 
 import (
 	"context"
+	"net"
+	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -12,7 +15,6 @@ import (
 	"github.com/honest-hosting/nomad-csi-driver/internal/config"
 	"github.com/honest-hosting/nomad-csi-driver/internal/driver"
 	"github.com/honest-hosting/nomad-csi-driver/internal/iscsi"
-	"github.com/honest-hosting/nomad-csi-driver/internal/metrics"
 	"github.com/honest-hosting/nomad-csi-driver/internal/mountutil"
 	"github.com/honest-hosting/nomad-csi-driver/internal/multipath"
 	"github.com/honest-hosting/nomad-csi-driver/internal/stats"
@@ -29,19 +31,92 @@ type node struct {
 	meta         metaStore
 	useMultipath bool
 	log          *zap.Logger
-	metrics      *qnapNodeMetrics     // qnap-specific (login/stage/rescan/device); nil-safe
-	nodeM        *metrics.NodeMetrics // shared node metrics (staged count); nil-safe
-	stats        *stats.Registry      // per-volume usage stats; nil-safe no-op when disabled
+	metrics      *qnapNodeMetrics  // qnap-specific (login/stage/rescan/device); nil-safe
+	stats        *stats.Registry   // per-volume usage stats; nil-safe no-op when disabled
+	san          *sanIdentityCache // read-only SAN identity resolver for cold-cache block teardown (tier 3); nil = degrade open
 
 	// waitForPath polls until path exists and returns its resolved real path.
 	// Overridable in tests; defaults to an os-backed poller.
 	waitForPath func(ctx context.Context, path string) (string, error)
+	// holdersFn reports whether a block device is currently held (opened/stacked),
+	// read from /sys/block/<dev>/holders. Overridable in tests; nil skips the check.
+	holdersFn func(device string) (bool, error)
+}
+
+// StagedCount reports how many of THIS plugin's volumes are currently staged on
+// this node, counted from live iSCSI sessions (metrics.StagedCounter). A staged
+// qnap volume is one target-IQN/LUN this node is logged into; login happens at
+// stage, so this counts staged-or-published (the correct "staged" semantic) and
+// includes block volumes (their session exists even before publish). Multipath
+// yields one session per portal path, so we de-dupe on (IQN, LUN).
+//
+// OQ1: scope to this plugin's own portals so other qnap plugins' SANs on the
+// same host are not counted. (Two plugins sharing identical portals can't be
+// separated by portal alone — a documented limit.)
+func (n *node) StagedCount(ctx context.Context) (int, error) {
+	sessions, err := n.iscsi.ListSessions(ctx)
+	if err != nil {
+		return 0, err
+	}
+	ours := n.ourPortals()
+	seen := map[string]struct{}{}
+	for _, s := range sessions {
+		if !portalOwned(s.Portal, ours) {
+			continue // another plugin's SAN
+		}
+		seen[s.IQN+"/"+strconv.Itoa(s.LUN)] = struct{}{}
+	}
+	return len(seen), nil
+}
+
+// portalOwned reports whether a session portal belongs to this plugin. The qnap
+// NODE normally has NO statically configured portals (it reads them from each
+// volume's context, not config), so ours is empty and scoping is disabled — every
+// session is treated as ours. When portals ARE configured, only matching ones
+// count (OQ1: separates co-located plugins targeting different SANs).
+func portalOwned(portal string, ours map[string]struct{}) bool {
+	if len(ours) == 0 {
+		return true
+	}
+	_, ok := ours[normalizePortal(portal)]
+	return ok
+}
+
+// cachedIQNs is the set of target IQNs staged this process lifetime (tier-1
+// cache), so the reconciler does not mistake their sessions for leaks.
+func (n *node) cachedIQNs() map[string]struct{} { return n.meta.iqns() }
+
+// ourPortals is the set of this plugin's configured portals, normalized to
+// "host:port", used to scope host-session enumeration to this plugin's SAN (OQ1).
+func (n *node) ourPortals() map[string]struct{} {
+	ours := map[string]struct{}{}
+	for _, p := range n.cfg.PortalList() {
+		if np := normalizePortal(p); np != "" {
+			ours[np] = struct{}{}
+		}
+	}
+	return ours
+}
+
+// normalizePortal renders an iSCSI portal as "host:port" with the default iSCSI
+// port 3260 supplied when absent, so a configured portal (which may omit the
+// port) compares equal to the "ip:port" form iscsiadm reports. Note: a portal
+// configured as a hostname will not match iscsiadm's resolved-IP form — the
+// documented residual of portal-based scoping.
+func normalizePortal(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	if _, _, err := net.SplitHostPort(p); err != nil {
+		return net.JoinHostPort(p, "3260")
+	}
+	return p
 }
 
 func (n *node) StageVolume(ctx context.Context, req *driver.StageRequest) (err error) {
 	defer func() {
 		if err == nil {
-			n.nodeM.StagedInc()
 			n.stats.Track(req.VolumeID, req.StagingTargetPath, stageAccessType(req.VolumeCapability.AccessType))
 		}
 	}()
@@ -72,31 +147,205 @@ func (n *node) StageVolume(ctx context.Context, req *driver.StageRequest) (err e
 	return nil
 }
 
+// UnstageVolume tears down a volume's iSCSI/multipath attachment without relying
+// on any durable plugin state. It resolves the teardown identity from the cheapest
+// available source (tier 1 in-memory cache → tier 2 host reconstruction from the
+// staging mount → tier 3 SAN identity for cold block volumes), guards against
+// tearing down a still-in-use device (#25813/OQ3), and only logs a shared 1:N
+// target out when this is its last live LUN (OQ2).
 func (n *node) UnstageVolume(ctx context.Context, req *driver.UnstageRequest) error {
+	id, found := n.resolveTeardown(ctx, req)
+
+	// In-use guard BEFORE unmount, so a premature unstage (#25813) returns
+	// FAILED_PRECONDITION with the staging mount intact — the retry after unpublish
+	// can then still reconstruct the identity from that mount.
+	if found {
+		if inUse, err := n.deviceInUse(ctx, req, id); err != nil {
+			n.log.Warn("teardown in-use check failed; proceeding", zap.Error(err))
+		} else if inUse {
+			return driver.FailedPrecondition("volume %s still in use on node %q; refusing to detach", req.VolumeID, n.nodeID)
+		}
+	}
+
 	if err := n.mounter.Unmount(ctx, req.StagingTargetPath); err != nil {
 		return driver.Internal("unmount staging: %v", err)
 	}
 	n.stats.Untrack(req.VolumeID)
-	meta, err := n.meta.Load(req.VolumeID)
-	if err != nil {
-		// No metadata: the volume was never staged here (or already cleaned).
-		n.log.Debug("no stage metadata at unstage; nothing to detach", zap.String("volume", req.VolumeID))
+
+	if !found {
+		// Never staged here, already cleaned, or a cold-cache block volume the SAN
+		// path could not identify — nothing to detach (idempotent per CSI).
+		n.log.Debug("no teardown identity at unstage; nothing to detach", zap.String("volume", req.VolumeID))
 		return nil
 	}
-	if n.useMultipath && meta.WWID != "" {
-		if err := n.mpath.Flush(ctx, meta.WWID); err != nil {
-			n.log.Warn("flushing multipath map (ignored)", zap.String("wwid", meta.WWID), zap.Error(err))
+
+	if n.useMultipath && id.WWID != "" {
+		if err := n.mpath.Flush(ctx, id.WWID); err != nil {
+			n.log.Warn("flushing multipath map (ignored)", zap.String("wwid", id.WWID), zap.Error(err))
 		}
 	}
-	if meta.IQN != "" {
-		for _, p := range meta.portalList() {
-			if err := n.iscsi.Logout(ctx, p, meta.IQN); err != nil {
-				n.log.Warn("iscsi logout (ignored)", zap.String("portal", p), zap.String("iqn", meta.IQN), zap.Error(err))
+
+	// OQ2: only log the target session out when this is its last LUN on the node.
+	// A shared (1:N) target still serving other LUNs must stay logged in.
+	if id.IQN != "" {
+		if n.lastLUNOnTarget(ctx, id.IQN, id.LUNNumber) {
+			for _, p := range id.portalList() {
+				if err := n.iscsi.Logout(ctx, p, id.IQN); err != nil {
+					n.log.Warn("iscsi logout (ignored)", zap.String("portal", p), zap.String("iqn", id.IQN), zap.Error(err))
+				}
 			}
+		} else {
+			n.log.Info("shared target still serving other LUNs; leaving session logged in",
+				zap.String("iqn", id.IQN), zap.Int("lun", id.LUNNumber))
 		}
 	}
-	n.nodeM.StagedDec() // metadata was present -> this node had it staged
+
 	return n.meta.Delete(req.VolumeID)
+}
+
+// resolveTeardown finds the iSCSI/multipath identity needed to detach a volume,
+// cheapest source first (§5.2): tier 1 in-memory cache, tier 2 host
+// reconstruction from the still-present staging mount (filesystem volumes),
+// tier 3 SAN identity lookup for cold-cache block volumes. found=false means the
+// volume could not be identified (never staged here, already gone, or a cold
+// block volume) — the caller then unmounts and returns OK without detaching.
+func (n *node) resolveTeardown(ctx context.Context, req *driver.UnstageRequest) (stageMeta, bool) {
+	if m, err := n.meta.Load(req.VolumeID); err == nil {
+		return m, true // tier 1: warm cache
+	}
+	if m, ok := n.reconstructFromMount(ctx, req.StagingTargetPath); ok {
+		return m, true // tier 2: fs host reconstruction
+	}
+	if m, ok := n.reconstructFromSAN(ctx, req.VolumeID); ok {
+		return m, true // tier 3: block SAN identity
+	}
+	return stageMeta{}, false
+}
+
+// reconstructFromMount rebuilds a volume's teardown identity from the host when
+// the staging path is still mounted (a filesystem volume, cold cache): the
+// mount's source device → its multipath member paths → the iSCSI sessions those
+// paths belong to → {IQN, portals, WWID}. Scoped to this plugin's portals (OQ1).
+func (n *node) reconstructFromMount(ctx context.Context, stagingPath string) (stageMeta, bool) {
+	dev, err := n.mounter.SourceDevice(ctx, stagingPath)
+	if err != nil {
+		return stageMeta{}, false // not mounted (block, or already unmounted)
+	}
+	sessions, err := n.iscsi.ListSessions(ctx)
+	if err != nil {
+		n.log.Warn("reconstruct teardown: listing sessions failed", zap.Error(err))
+		return stageMeta{}, false
+	}
+
+	// Determine the member path devices backing the mount source.
+	var wwid string
+	members := map[string]struct{}{}
+	if strings.HasPrefix(dev, "/dev/mapper/") {
+		wwid = filepath.Base(dev)
+		mem, merr := n.mpath.Members(ctx, wwid)
+		if merr != nil {
+			n.log.Warn("reconstruct teardown: multipath members lookup failed", zap.String("wwid", wwid), zap.Error(merr))
+		}
+		for _, d := range mem {
+			members[filepath.Base(d)] = struct{}{}
+		}
+	} else {
+		members[filepath.Base(dev)] = struct{}{}
+	}
+
+	ours := n.ourPortals()
+	var iqn string
+	var lun int
+	portals := map[string]struct{}{}
+	for _, s := range sessions {
+		if _, ok := members[filepath.Base(s.Device)]; !ok {
+			continue
+		}
+		if !portalOwned(s.Portal, ours) {
+			continue // another plugin's SAN
+		}
+		iqn = s.IQN
+		lun = s.LUN
+		portals[normalizePortal(s.Portal)] = struct{}{}
+	}
+	if iqn == "" {
+		return stageMeta{}, false // could not correlate device to a session
+	}
+	return stageMeta{IQN: iqn, LUNNumber: lun, WWID: wwid, Portals: sortedKeys(portals)}, true
+}
+
+// deviceInUse reports whether the volume's device is still referenced by a mount
+// OTHER than the staging mount being torn down — a publish bind-mount at a target
+// (fs: source is the staging dir; block: source is the mapper device) or a second
+// staging mount under multi-writer sharing. Logging the session out while such a
+// mount is live would break it, so the caller refuses (FAILED_PRECONDITION).
+func (n *node) deviceInUse(ctx context.Context, req *driver.UnstageRequest, id stageMeta) (bool, error) {
+	mounts, err := n.mounter.ListMounts(ctx)
+	if err != nil {
+		return false, err
+	}
+	var mapperDev string
+	if id.WWID != "" {
+		mapperDev = n.mpath.MapperPath(id.WWID)
+	}
+	for _, m := range mounts {
+		if m.Target == req.StagingTargetPath {
+			continue // the staging mount we are tearing down
+		}
+		if m.Source == req.StagingTargetPath { // fs publish bind-mount
+			return true, nil
+		}
+		if mapperDev != "" && m.Source == mapperDev { // block publish / shared staging
+			return true, nil
+		}
+	}
+	// OQ3: block volumes have no staging mount to check, so also consult the
+	// device's kernel holders (a raw open not visible as a mount).
+	if mapperDev != "" && n.holdersFn != nil {
+		if held, herr := n.holdersFn(mapperDev); herr == nil && held {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// deviceHasHolders reports whether a block device currently has holders — some
+// other device-mapper target or open referencing it — via /sys/block/<dev>/
+// holders. Best-effort: an unreadable path yields (false, nil) so a missing
+// sysfs entry never spuriously blocks teardown.
+func deviceHasHolders(device string) (bool, error) {
+	name := filepath.Base(device)
+	if resolved, err := filepath.EvalSymlinks(device); err == nil {
+		name = filepath.Base(resolved) // /dev/mapper/<wwid> → dm-N
+	}
+	entries, err := os.ReadDir(filepath.Join("/sys/block", name, "holders"))
+	if err != nil {
+		return false, nil
+	}
+	return len(entries) > 0, nil
+}
+
+// lastLUNOnTarget reports whether lun is the only LUN of iqn currently logged in
+// on this node — i.e. logging the target out will not cut off another still-
+// attached LUN (the 1:N shared-target case, OQ2). On a session-list error it
+// returns true (best-effort: proceed with logout rather than leak).
+func (n *node) lastLUNOnTarget(ctx context.Context, iqn string, lun int) bool {
+	sessions, err := n.iscsi.ListSessions(ctx)
+	if err != nil {
+		n.log.Warn("refcount: listing sessions failed; assuming last LUN", zap.Error(err))
+		return true
+	}
+	luns := map[int]struct{}{}
+	for _, s := range sessions {
+		if s.IQN == iqn {
+			luns[s.LUN] = struct{}{}
+		}
+	}
+	if len(luns) == 0 {
+		return true // session already gone; logout is a harmless no-op
+	}
+	_, hasOurs := luns[lun]
+	return len(luns) == 1 && hasOurs
 }
 
 func (n *node) PublishVolume(ctx context.Context, req *driver.PublishRequest) error {
@@ -198,6 +447,68 @@ func (n *node) loginPortals(ctx context.Context, portals []string, iqn string) (
 			zap.String("iqn", iqn), zap.Int("paths", len(active)), zap.Strings("portals", active))
 	}
 	return active, nil
+}
+
+// reconstructFromSAN resolves a block volume's teardown identity when the cache
+// is cold and there is no staging mount to anchor host reconstruction (tier 3):
+// the SAN provides the target IQN (verified against the LUN name), and this
+// node's live iSCSI sessions to that IQN ground the LUN number + WWID. Requires
+// a read-only node SAN client; without one, or on any SAN error, it degrades
+// open (the caller leaves the session for the reconciler).
+func (n *node) reconstructFromSAN(ctx context.Context, volumeID string) (stageMeta, bool) {
+	if n.san == nil {
+		n.log.Warn("cold-cache block volume: no node SAN client; leaving session for reconciler",
+			zap.String("volume", volumeID))
+		return stageMeta{}, false
+	}
+	eid, err := parseExternalID(volumeID)
+	if err != nil {
+		return stageMeta{}, false
+	}
+	iqn, ok := n.san.resolveIQN(ctx, eid)
+	if !ok {
+		return stageMeta{}, false
+	}
+	// Ground the LUN number + WWID in this node's live sessions to that IQN.
+	sessions, err := n.iscsi.ListSessions(ctx)
+	if err != nil {
+		n.log.Warn("reconstruct(SAN): listing sessions failed", zap.Error(err))
+		return stageMeta{}, false
+	}
+	ours := n.ourPortals()
+	portals := map[string]struct{}{}
+	lun := -1
+	var device string
+	for _, s := range sessions {
+		if s.IQN != iqn {
+			continue
+		}
+		if !portalOwned(s.Portal, ours) {
+			continue
+		}
+		lun = s.LUN
+		device = s.Device
+		portals[normalizePortal(s.Portal)] = struct{}{}
+	}
+	if lun < 0 {
+		return stageMeta{}, false // SAN knows the target, but nothing attached on this node
+	}
+	wwid := ""
+	if n.useMultipath && device != "" {
+		wwid, _ = n.mpath.MapWWID(ctx, device)
+	}
+	return stageMeta{IQN: iqn, LUNNumber: lun, WWID: wwid, Portals: sortedKeys(portals)}, true
+}
+
+// sortedKeys returns the map's keys in deterministic (sorted) order, so a
+// reconstructed portal list is stable across calls.
+func sortedKeys(m map[string]struct{}) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // stageAccessType maps the CSI access type to the stats access-type label.

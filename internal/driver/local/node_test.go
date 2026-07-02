@@ -5,43 +5,71 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
 	"github.com/honest-hosting/nomad-csi-driver/internal/driver"
 	cexec "github.com/honest-hosting/nomad-csi-driver/internal/exec"
-	"github.com/honest-hosting/nomad-csi-driver/internal/metrics"
 	"github.com/honest-hosting/nomad-csi-driver/internal/mountutil"
 	"github.com/honest-hosting/nomad-csi-driver/internal/zfs"
 )
 
-// gaugeValue gathers reg and returns the value of a single-series gauge by name.
-func gaugeValue(t *testing.T, reg *prometheus.Registry, name string) float64 {
-	t.Helper()
-	mfs, err := reg.Gather()
-	require.NoError(t, err)
-	for _, mf := range mfs {
-		if mf.GetName() != name {
-			continue
-		}
-		require.Len(t, mf.GetMetric(), 1)
-		return mf.GetMetric()[0].GetGauge().GetValue()
-	}
-	t.Fatalf("gauge %q not found", name)
-	return 0
-}
-
 func newTestNode(fr cexec.Runner) *node {
 	return &node{
-		cfg:         testConfig(),
-		z:           zfs.New(fr),
-		nodeID:      "A",
-		mounter:     mountutil.New(fr, zap.NewNop()),
-		log:         zap.NewNop(),
-		waitForPath: func(_ context.Context, p string) (string, error) { return p, nil },
+		cfg:           testConfig(),
+		z:             zfs.New(fr),
+		nodeID:        "A",
+		parentDataset: "nomad-csi", // deployment default; testConfig's tank overrides to "csi"
+		mounter:       mountutil.New(fr, zap.NewNop()),
+		log:           zap.NewNop(),
+		waitForPath:   func(_ context.Context, p string) (string, error) { return p, nil },
+		zvolDevices:   func() map[string]struct{} { return nil }, // overridden per-test
 	}
+}
+
+func TestStagedCount(t *testing.T) {
+	// This plugin's zvol device set: v1 by its /dev/zvol symlink, v2 by its
+	// resolved /dev/zdN device (the form findmnt actually reports). Mounts: v1's
+	// staging mount (symlink form), v1's publish bind-mount (source = staging dir,
+	// not the zvol → counted once), v2's staging mount (/dev/zd0 form), the root
+	// fs, and a FOREIGN plugin's zvol that is NOT in our set.
+	const findmnt = `/ /dev/vda1
+/opt/nomad/.../staging/v1/rw-file-system /dev/zvol/tank/csi/v1
+/opt/nomad/.../per-alloc/a/v1/rw /opt/nomad/.../staging/v1/rw-file-system
+/opt/nomad/.../staging/v2/rw-file-system /dev/zd0
+/opt/nomad/.../staging/other/rw-file-system /dev/zvol/tank/other-plugin/z9
+`
+	fr := &cexec.FakeRunner{Responder: func(c cexec.Command) (cexec.Output, error) {
+		if c.Name == "findmnt" {
+			return cexec.Output{Stdout: []byte(findmnt)}, nil
+		}
+		return cexec.Output{}, nil
+	}}
+	n := newTestNode(fr)
+	n.zvolDevices = func() map[string]struct{} {
+		return map[string]struct{}{"/dev/zvol/tank/csi/v1": {}, "/dev/zd0": {}}
+	}
+	got, err := n.StagedCount(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 2, got, "count this plugin's two staged zvols (symlink + resolved form) once each; exclude bind-mount, root fs, and foreign zvol")
+}
+
+func TestStagedCountEmptyAndError(t *testing.T) {
+	// No mounts → 0.
+	empty := &cexec.FakeRunner{Responder: func(c cexec.Command) (cexec.Output, error) {
+		return cexec.Output{}, &cexec.Error{Name: "findmnt", ExitCode: 1}
+	}}
+	got, err := newTestNode(empty).StagedCount(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 0, got)
+
+	// findmnt hard error → surfaced (the gauge holds last-good).
+	boom := &cexec.FakeRunner{Responder: func(c cexec.Command) (cexec.Output, error) {
+		return cexec.Output{}, &cexec.Error{Name: "findmnt", ExitCode: 127}
+	}}
+	_, err = newTestNode(boom).StagedCount(context.Background())
+	require.Error(t, err)
 }
 
 func TestNodeStage_FormatsAndMounts(t *testing.T) {
@@ -81,57 +109,6 @@ func TestNodeStage_WrongNodeGuard(t *testing.T) {
 	var de *driver.Error
 	require.ErrorAs(t, err, &de)
 	assert.Equal(t, driver.CodeFailedPrecondition, de.Code)
-}
-
-func TestNodeStage_StagedGauge(t *testing.T) {
-	fr := &cexec.FakeRunner{Responder: func(c cexec.Command) (cexec.Output, error) {
-		switch c.Name {
-		case "blkid":
-			return cexec.Output{}, &cexec.Error{ExitCode: 2} // empty → format
-		case "findmnt":
-			return cexec.Output{}, &cexec.Error{ExitCode: 1} // not mounted
-		case "zpool":
-			return cexec.Output{Stdout: []byte("ONLINE\n")}, nil
-		}
-		return cexec.Output{}, nil
-	}}
-	reg := prometheus.NewRegistry()
-	nm := metrics.NewNodeMetrics(reg)
-	n := newTestNode(fr)
-	n.nodeM = nm
-	n.mounter = mountutil.New(fr, zap.NewNop()).WithMetrics(nm)
-
-	const name = "nomad_csi_node_staged_volumes"
-	stage := &driver.StageRequest{
-		VolumeID:          externalID{Node: "A", Dataset: "tank/csi/v1"}.String(),
-		StagingTargetPath: "/tmp/csi-local-stage",
-		VolumeCapability:  driver.VolumeCapability{AccessType: driver.AccessTypeMount, FsType: "ext4"},
-		VolumeContext:     map[string]string{ctxKeyDataset: "tank/csi/v1", ctxKeyFsType: "ext4", ctxKeyNode: "A"},
-	}
-	require.NoError(t, n.StageVolume(context.Background(), stage))
-	assert.Equal(t, 1.0, gaugeValue(t, reg, name), "staged gauge should be 1 after a successful stage")
-
-	require.NoError(t, n.UnstageVolume(context.Background(), &driver.UnstageRequest{
-		VolumeID:          stage.VolumeID,
-		StagingTargetPath: stage.StagingTargetPath,
-	}))
-	assert.Equal(t, 0.0, gaugeValue(t, reg, name), "staged gauge should return to 0 after unstage")
-}
-
-func TestNodeStage_StagedGaugeUnchangedOnFailure(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	nm := metrics.NewNodeMetrics(reg)
-	n := newTestNode(&cexec.FakeRunner{})
-	n.nodeM = nm
-	// Wrong-node guard fires before any mount work → stage fails, gauge stays 0.
-	err := n.StageVolume(context.Background(), &driver.StageRequest{
-		VolumeID:          externalID{Node: "B", Dataset: "tank/csi/v1"}.String(),
-		StagingTargetPath: "/tmp/x",
-		VolumeCapability:  driver.VolumeCapability{AccessType: driver.AccessTypeMount, FsType: "ext4"},
-		VolumeContext:     map[string]string{ctxKeyDataset: "tank/csi/v1", ctxKeyNode: "B"},
-	})
-	require.Error(t, err)
-	assert.Equal(t, 0.0, gaugeValue(t, reg, "nomad_csi_node_staged_volumes"))
 }
 
 func TestNodeGetInfo_AdvertisesTopology(t *testing.T) {
