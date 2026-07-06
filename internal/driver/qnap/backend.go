@@ -44,15 +44,16 @@ const (
 
 // backend implements driver.Backend for the qnap SAN backend.
 type backend struct {
-	caps       driver.Capabilities
-	ctrl       *controller
-	nd         *node
-	statsReg   *stats.Registry    // node-side per-volume usage stats; nil for controller-only
-	forwardSrv *http.Server       // node-side stats forwarding server
-	source     *qnapSource        // controller-side fan-out aggregate
-	queryS     *stats.QueryServer // controller-side public query API
-	stopRecon  context.CancelFunc // stops the node session reconciler; nil for controller-only
-	log        *zap.Logger
+	caps           driver.Capabilities
+	ctrl           *controller
+	nd             *node
+	statsReg       *stats.Registry    // node-side per-volume usage stats; nil for controller-only
+	forwardSrv     *http.Server       // node-side stats forwarding server
+	source         *qnapSource        // controller-side fan-out aggregate
+	queryS         *stats.QueryServer // controller-side public query API
+	stopRecon      context.CancelFunc // stops the node session reconciler; nil for controller-only
+	stopStatsRecon context.CancelFunc // stops the node stats rehydration reconciler; nil for controller-only
+	log            *zap.Logger
 }
 
 // New constructs the qnap backend for the given mode.
@@ -106,6 +107,13 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 	}
 
 	if d.Mode.HasNode() {
+		// The node needs read-only SAN access to resolve iSCSI sessions to volume
+		// identities (per-volume stats rehydration across restarts + cold-cache
+		// teardown). Without credentials that is impossible, so refuse to start
+		// rather than silently under-report stats / leak sessions.
+		if err := validateNodeConfig(cfg); err != nil {
+			return nil, err
+		}
 		mpath := multipath.New(d.Runner, cfg.MultipathConfigDir)
 		var qnm *qnapNodeMetrics
 		if d.Metrics != nil {
@@ -127,6 +135,12 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 			san:          newNodeSANCache(cfg, d, log), // tier-3 cold-block identity; nil when no SAN creds
 			holdersFn:    deviceHasHolders,
 			waitForPath:  osWaitForPath(devAppearTimeout),
+		}
+		// Credentials were validated present above, so a nil SAN cache here means the
+		// read-only client could not be built (bad URL/TLS). It is mandatory in node
+		// mode — fail fast rather than degrade.
+		if b.nd.san == nil {
+			return nil, driver.Internal("qnap node: read-only SAN client is required in node mode but could not be initialized (check qnap.base_url / username / password / insecure)")
 		}
 		if b.nd.useMultipath {
 			b.installMultipathDropin(context.Background(), mpath)
@@ -154,6 +168,19 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 				zap.Duration("interval", interval), zap.Duration("grace", grace))
 		} else {
 			log.Info("qnap node session reconciler disabled (set qnap.reconcile_enabled = true to enable leaked-session cleanup)")
+		}
+
+		// Stats rehydration reconciler: rebuild the per-volume stats registry from
+		// live iSCSI sessions after a restart (Nomad does not re-issue
+		// NodeStageVolume), resolving each session's (IQN, LUN) → external id via the
+		// read-only SAN. Always on when stats are enabled (unlike the session
+		// reconciler, this is side-effect-free — it never logs a session out).
+		if statsCfg.Enabled {
+			reconCtx, cancel := context.WithCancel(context.Background())
+			b.stopStatsRecon = cancel
+			go newStatsReconciler(b.nd, b.statsReg, statsCfg.Interval).Run(reconCtx)
+			log.Info("qnap stats reconciler started (rehydrates per-volume stats from iSCSI sessions across restarts)",
+				zap.Duration("interval", statsCfg.Interval))
 		}
 	}
 
@@ -246,6 +273,9 @@ func (b *backend) Capabilities() driver.Capabilities { return b.caps }
 func (b *backend) Shutdown(ctx context.Context) error {
 	if b.stopRecon != nil {
 		b.stopRecon()
+	}
+	if b.stopStatsRecon != nil {
+		b.stopStatsRecon()
 	}
 	b.statsReg.Close()
 	b.source.Close()
@@ -357,6 +387,22 @@ func validateControllerConfig(cfg *config.QNAPConfig) error {
 		// Without a portal the volume context carries no iSCSI target host, so
 		// NodeStageVolume fails later with "missing portal/iqn". Fail fast here.
 		return driver.InvalidArgument("qnap.portal (or qnap.portals) is required for controller mode (the iSCSI portal(s) nodes connect to)")
+	}
+	return nil
+}
+
+// validateNodeConfig enforces that the node (and monolith) half has the read-only
+// SAN credentials it now requires: without them the node cannot resolve iSCSI
+// sessions to volume identities, so per-volume stats would silently under-report
+// across restarts and cold-cache teardown would leak sessions. The plugin refuses
+// to start rather than run degraded. (QNAP has no read-only API account, so these
+// are the same credentials the controller uses — see config.QNAPConfig.)
+func validateNodeConfig(cfg *config.QNAPConfig) error {
+	switch {
+	case cfg.BaseURL == "":
+		return driver.InvalidArgument("qnap.base_url is required for node/monolith mode: the node needs read-only SAN access to resolve iSCSI sessions to volume identities (per-volume stats + cold-cache teardown)")
+	case cfg.Username == "" || cfg.Password == "":
+		return driver.InvalidArgument("qnap.username and qnap.password are required for node/monolith mode (read-only SAN access; see qnap.base_url)")
 	}
 	return nil
 }

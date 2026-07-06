@@ -1,5 +1,7 @@
 # Example: qnap node plugin (system job — runs on every client). Performs
-# iSCSI login, multipath assembly, format/mount. Never talks to the appliance.
+# iSCSI login, multipath assembly, format/mount. Also needs READ-ONLY SAN creds:
+# it resolves iSCSI sessions to volume identities (per-volume stats rehydration +
+# cold-cache teardown). The plugin refuses to start in node mode without them.
 
 job "csi-qnap-node" {
   datacenters = ["dc1"]
@@ -33,10 +35,16 @@ job "csi-qnap-node" {
         destination = "local/config.hcl"
         data        = <<-EOF
           # The node reads the portal(s)/IQN/LUN from the CSI volume context the
-          # controller populates (multipath included), so it needs no appliance
-          # creds or portals. The only config it needs is the stats forwarding
-          # server, so the controller can pull its per-volume readings.
+          # controller populates (multipath included). It ALSO needs read-only SAN
+          # credentials (same as the controller — QNAP has no read-only account) to
+          # resolve iSCSI sessions to volume identities for per-volume stats and
+          # cold-cache teardown; without them the plugin refuses to start.
           qnap {
+            base_url = "{{ with nomadVar "nomad/jobs/csi-qnap-node" }}{{ .base_url }}{{ end }}"
+            username = "{{ with nomadVar "nomad/jobs/csi-qnap-node" }}{{ .username }}{{ end }}"
+            password = "{{ with nomadVar "nomad/jobs/csi-qnap-node" }}{{ .password }}{{ end }}"
+            # insecure = true  # skip TLS verification for a self-signed appliance cert
+
             # Same secret as the controller; :9612 is the cluster-uniform port the
             # controller dials. Omit to leave the node out of central stats.
             forward_secret = "{{ with nomadVar "nomad/jobs/csi-qnap-node" }}{{ .forward_secret }}{{ end }}"

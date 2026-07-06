@@ -24,7 +24,7 @@ func newTestNode(fr cexec.Runner) *node {
 		mounter:       mountutil.New(fr, zap.NewNop()),
 		log:           zap.NewNop(),
 		waitForPath:   func(_ context.Context, p string) (string, error) { return p, nil },
-		zvolDevices:   func() map[string]struct{} { return nil }, // overridden per-test
+		zvolDatasets:  func() map[string]string { return nil }, // overridden per-test
 	}
 }
 
@@ -47,8 +47,8 @@ func TestStagedCount(t *testing.T) {
 		return cexec.Output{}, nil
 	}}
 	n := newTestNode(fr)
-	n.zvolDevices = func() map[string]struct{} {
-		return map[string]struct{}{"/dev/zvol/tank/csi/v1": {}, "/dev/zd0": {}}
+	n.zvolDatasets = func() map[string]string {
+		return map[string]string{"/dev/zvol/tank/csi/v1": "tank/csi/v1", "/dev/zd0": "tank/csi/v2"}
 	}
 	got, err := n.StagedCount(context.Background())
 	require.NoError(t, err)

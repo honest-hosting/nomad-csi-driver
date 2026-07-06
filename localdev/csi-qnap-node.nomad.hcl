@@ -4,8 +4,12 @@
 #
 # Privileged + /dev so the cgroup device controller permits the iSCSI/multipath
 # (dm) devices; host networking to reach the iSCSI portal. The node reads the
-# portal/IQN from the CSI volume context, so its config needs no appliance
-# creds — an empty qnap{} block is enough.
+# portal/IQN from the CSI volume context, BUT it now also needs READ-ONLY SAN
+# credentials: it resolves iSCSI sessions to volume identities (for per-volume
+# stats rehydration across restarts + cold-cache teardown). The plugin refuses to
+# start in node mode without base_url/username/password. NOTE: QNAP has no
+# read-only API account, so these are the same credentials the controller uses —
+# scope their exposure accordingly.
 
 variable "image" {
   type = string
@@ -14,6 +18,24 @@ variable "image" {
 variable "plugin_id" {
   type    = string
   default = "nomad-csi-driver-qnap"
+}
+
+variable "base_url" {
+  type        = string
+  description = "QNAP appliance base URL (read-only SAN access for session→volume resolution)."
+}
+
+variable "username" {
+  type = string
+}
+
+variable "password" {
+  type = string
+}
+
+variable "insecure" {
+  type    = bool
+  default = false
 }
 
 variable "metrics_enabled" {
@@ -75,8 +97,16 @@ job "nomad-csi-driver-qnap-node" {
         destination = "local/config.hcl"
         data        = <<EOH
 qnap {
-  # The node reads volume/iSCSI details from the CSI volume context; it only needs
-  # the stats forwarding server config here so the controller can pull its
+  # Read-only SAN access: required in node mode to resolve iSCSI sessions to volume
+  # identities (per-volume stats rehydration + cold-cache teardown). Same creds the
+  # controller uses (QNAP has no read-only API account).
+  base_url = "${var.base_url}"
+  username = "${var.username}"
+  password = "${var.password}"
+  insecure = ${var.insecure}
+
+  # The node reads volume/iSCSI attach details from the CSI volume context; it only
+  # needs the stats forwarding server config here so the controller can pull its
   # per-volume readings. Port :9612 is distinct from the local backend's :9602.
   forward_secret = "${var.forward_secret}"
   forward_addr   = ":9612"

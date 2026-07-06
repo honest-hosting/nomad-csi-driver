@@ -85,6 +85,10 @@ if [ -n "${QNAP_INTEGRATION_URL:-}" ]; then
     -detach \
     -var "image=$IMAGE" \
     -var "plugin_id=$QNAP_ID" \
+    -var "base_url=$QNAP_INTEGRATION_URL" \
+    -var "username=${QNAP_INTEGRATION_USER:-}" \
+    -var "password=${QNAP_INTEGRATION_PASSWORD:-}" \
+    -var "insecure=$insecure" \
     -var "metrics_address=0.0.0.0:${QNAP_INTEGRATION_NODE_METRICS_PORT:-9502}" \
     localdev/csi-qnap-node.nomad.hcl || exit 1
   wait_healthy "$QNAP_ID" 1 || exit 1

@@ -29,9 +29,13 @@ type Config struct {
 // QNAPConfig holds the --driver=qnap controller/node settings. Credentials live
 // here (sourced from a file Nomad mounts), never on argv.
 type QNAPConfig struct {
-	// BaseURL is required for controller mode (validated at startup); node mode
-	// reads everything it needs from the CSI volume context, so its config may
-	// omit it.
+	// BaseURL / Username / Password are REQUIRED for controller AND node/monolith
+	// mode (validated at startup; the plugin refuses to start without them). The
+	// node needs read-only SAN access to resolve iSCSI sessions to volume
+	// identities — for per-volume stats rehydration across restarts and cold-cache
+	// teardown. NOTE: QNAP has no granular read-only API account, so these are the
+	// same full-power credentials the controller holds; scope their exposure
+	// accordingly.
 	BaseURL  string `hcl:"base_url,optional"`
 	Username string `hcl:"username,optional"`
 	Password string `hcl:"password,optional"`

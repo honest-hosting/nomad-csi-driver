@@ -47,6 +47,36 @@ func TestSANCache_ResolvesAndVerifiesLUNName(t *testing.T) {
 	assert.Equal(t, "iqn.qnap:t10", iqn)
 }
 
+func TestSANCache_ResolveExternalID(t *testing.T) {
+	fc := newFakeClient()
+	// 1:1 target: one LUN mapped at SCSI LUN 0, alias == LUN name → OwnTarget "t".
+	fc.targets[0] = goqnap.Target{Index: 0, IQN: "iqn.qnap:vol-a", Alias: "vol-a", LUNs: []int{42}}
+	// A shared 1:N target: two LUNs, alias != either name → OwnTarget "s".
+	fc.targets[7] = goqnap.Target{Index: 7, IQN: "iqn.qnap:shared", Alias: "shared", LUNs: []int{5, 9}}
+	fc.luns[42] = goqnap.LUN{Index: 42, Name: "vol-a"}
+	fc.luns[5] = goqnap.LUN{Index: 5, Name: "vol-b"}
+	fc.luns[9] = goqnap.LUN{Index: 9, Name: "vol-c"}
+	c := newSANIdentityCache(fc, newSessionManager(fc, "u", "p"), 30*time.Second, zap.NewNop())
+	c.nowFn = func() time.Time { return time.Unix(1000, 0) }
+
+	// 1:1 owned target → the verified production shape (qnap/v1/<lun>/<tgt>/t/<name>).
+	got, ok := c.resolveExternalID(context.Background(), "iqn.qnap:vol-a", 0)
+	require.True(t, ok)
+	assert.Equal(t, "qnap/v1/42/0/t/vol-a", got)
+
+	// Shared target: the SCSI LUN number selects the mapped LUN ordinally; alias !=
+	// name → shared ("s").
+	got, ok = c.resolveExternalID(context.Background(), "iqn.qnap:shared", 1)
+	require.True(t, ok)
+	assert.Equal(t, "qnap/v1/9/7/s/vol-c", got)
+
+	// Unknown IQN and out-of-range LUN number both fail cleanly (caller stays add-only).
+	_, ok = c.resolveExternalID(context.Background(), "iqn.qnap:nope", 0)
+	assert.False(t, ok)
+	_, ok = c.resolveExternalID(context.Background(), "iqn.qnap:shared", 5)
+	assert.False(t, ok, "LUN number past the target's mapped LUNs must not resolve")
+}
+
 func TestSANCache_RejectsNameMismatch(t *testing.T) {
 	// Index reuse: the LUN at index 42 is now a different volume → refuse (guard).
 	c, _ := newTestSANCache(t)
