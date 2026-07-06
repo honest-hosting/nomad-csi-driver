@@ -1,5 +1,6 @@
-# Example: qnap controller plugin (one per cluster/DC). Sole talker to the
-# appliance; holds credentials. Pair with qnap-node.nomad.hcl.
+# Example: qnap controller plugin (one per cluster/DC). Provisions LUNs on the
+# appliance (read-write); holds credentials. The node also talks to the appliance
+# but READ-ONLY (session→volume resolution). Pair with qnap-node.nomad.hcl.
 
 job "csi-qnap-controller" {
   datacenters = ["dc1"]

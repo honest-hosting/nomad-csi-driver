@@ -1,6 +1,7 @@
-# QNAP CSI controller — a count-1 SERVICE job (the sole talker to the appliance,
-# holds creds). Pairs with csi-qnap-node.nomad.hcl under the same plugin_id;
-# Nomad ties the controller + node daemonset into one CSI plugin.
+# QNAP CSI controller — a count-1 SERVICE job (provisions LUNs on the appliance
+# read-write, holds creds; the node also reads the appliance, read-only). Pairs
+# with csi-qnap-node.nomad.hcl under the same plugin_id; Nomad ties the controller
+# + node daemonset into one CSI plugin.
 #
 # No privileged/devices: the controller only speaks HTTP to the QNAP API.
 # host networking so it can reach the appliance. Secrets via -var for the e2e

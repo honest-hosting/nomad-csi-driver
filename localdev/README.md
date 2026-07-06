@@ -37,6 +37,10 @@ volumes/allocs, and cleans up.
   Point the suite at it with `NOMAD_CSI_INTEGRATION_IMAGE`.
 - For the **qnap** engine: a reachable QNAP appliance + the `QNAP_INTEGRATION_*`
   creds (same vars as go-qnap), and cluster nodes that can iSCSI-login to it.
+  `deploy.sh` now passes these creds to **both** the controller **and the node**
+  job — the node needs **read-only** SAN access to resolve iSCSI sessions to volume
+  identities (per-volume stats rehydration + cold-cache teardown) and refuses to
+  start without them.
 
 ## Environment
 

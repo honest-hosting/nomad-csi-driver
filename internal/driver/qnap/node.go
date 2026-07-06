@@ -69,6 +69,97 @@ func (n *node) StagedCount(ctx context.Context) (int, error) {
 	return len(seen), nil
 }
 
+// stagedSession is one volume this node has staged, identified purely from host
+// state: the iSCSI session's target IQN + SCSI LUN number, plus the staging mount
+// path (for a filesystem volume) and access type. The CSI external id is NOT known
+// from the host; the caller resolves it from the SAN (sanIdentityCache).
+type stagedSession struct {
+	IQN         string
+	LUN         int
+	StagingPath string // "" for a block volume (no filesystem mount to walk)
+	AccessType  string // stats.AccessMount | stats.AccessBlock
+}
+
+// stagedSessions enumerates this plugin's staged volumes from live iSCSI sessions,
+// de-duped on (IQN, LUN) (multipath yields one session per portal). For each it
+// finds the staging mount via the multipath-aware device→mount join: mounted →
+// AccessMount + path; not mounted → AccessBlock (presence only, no walk). Host-only
+// and scoped to this plugin's portals (OQ1). Used by the stats reconciler to
+// rehydrate the registry after a restart; the external id is resolved separately.
+func (n *node) stagedSessions(ctx context.Context) ([]stagedSession, error) {
+	sessions, err := n.iscsi.ListSessions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	mounts, err := n.mounter.ListMounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ours := n.ourPortals()
+
+	type key struct {
+		iqn string
+		lun int
+	}
+	devs := map[key][]string{}
+	var order []key
+	for _, s := range sessions {
+		if !portalOwned(s.Portal, ours) {
+			continue // another plugin's SAN
+		}
+		k := key{s.IQN, s.LUN}
+		if _, seen := devs[k]; !seen {
+			order = append(order, k)
+		}
+		if s.Device != "" {
+			devs[k] = append(devs[k], s.Device)
+		} else if _, seen := devs[k]; !seen {
+			devs[k] = nil
+		}
+	}
+
+	out := make([]stagedSession, 0, len(order))
+	for _, k := range order {
+		path, mounted := n.stagingMountFor(ctx, devs[k], mounts)
+		access := stats.AccessBlock
+		if mounted {
+			access = stats.AccessMount
+		}
+		out = append(out, stagedSession{IQN: k.iqn, LUN: k.lun, StagingPath: path, AccessType: access})
+	}
+	return out, nil
+}
+
+// stagingMountFor finds the mount target backing a session's member devices,
+// following the multipath mapper (a filesystem volume's staging mount source is the
+// mapper device, not the raw sdX). findmnt reports the RESOLVED device (/dev/dm-N),
+// so the mapper symlink candidate is compared symlink-resolved too. Returns
+// ("", false) for a block volume (no staging mount).
+func (n *node) stagingMountFor(ctx context.Context, memberDevs []string, mounts []mountutil.Mount) (string, bool) {
+	for _, dev := range memberDevs {
+		if dev == "" {
+			continue
+		}
+		candidates := []string{dev}
+		if n.useMultipath {
+			if wwid, err := n.mpath.MapWWID(ctx, dev); err == nil && wwid != "" {
+				candidates = append(candidates, n.mpath.MapperPath(wwid))
+			}
+		}
+		for _, cand := range candidates {
+			for _, m := range mounts {
+				if m.Source == cand {
+					return m.Target, true
+				}
+				if real, err := filepath.EvalSymlinks(cand); err == nil && m.Source == real {
+					return m.Target, true
+				}
+			}
+		}
+	}
+	return "", false
+}
+
 // portalOwned reports whether a session portal belongs to this plugin. The qnap
 // NODE normally has NO statically configured portals (it reads them from each
 // volume's context, not config), so ours is empty and scoping is disabled — every

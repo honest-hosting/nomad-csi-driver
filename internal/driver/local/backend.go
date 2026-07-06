@@ -47,15 +47,17 @@ const (
 )
 
 type backend struct {
-	caps       driver.Capabilities
-	ctrl       *controller
-	nd         *node
-	z          *zfs.ZFS
-	cfg        *config.LocalConfig
-	forwardSrv *http.Server
-	statsReg   *stats.Registry
-	queryS     *stats.QueryServer
-	log        *zap.Logger
+	caps          driver.Capabilities
+	ctrl          *controller
+	nd            *node
+	z             *zfs.ZFS
+	cfg           *config.LocalConfig
+	forwardSrv    *http.Server
+	statsReg      *stats.Registry
+	queryS        *stats.QueryServer
+	stopReconcile context.CancelFunc // stops the stats reconcile loop; nil when stats disabled
+	stopPeers     context.CancelFunc // stops the cluster_peers refresh loop; nil when metrics disabled
+	log           *zap.Logger
 }
 
 // New constructs the local backend. local is monolith-only, so both controller
@@ -157,7 +159,7 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 		statsReg: statsReg,
 		log:      log,
 	}
-	b.nd.zvolDevices = b.nd.osZvolDevices // read our zvol device set from /dev/zvol
+	b.nd.zvolDatasets = b.nd.osZvolDatasets // read our zvol device→dataset map from /dev/zvol
 
 	// node_staged_volumes: a GaugeFunc that counts this node's staged zvols from
 	// the live mount table on each scrape (host truth, so correct across restarts
@@ -185,6 +187,17 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 	// controller, so each exposes its own node's volumes (Prometheus aggregates
 	// across node scrapes; cross-node queries forward to the owner).
 	if statsCfg.Enabled {
+		// Rehydrate the per-volume stats registry from the live mount table on
+		// startup + on a ticker, so nomad_csi_volume_* survives a plugin restart
+		// (Nomad does not re-issue NodeStageVolume; the RPC-populated registry would
+		// otherwise stay empty — METRICS-RESTART-CONSISTENCY.PLAN.md).
+		reconCtx, cancel := context.WithCancel(context.Background())
+		b.stopReconcile = cancel
+		sr := &statsReconciler{nd: b.nd, reg: statsReg, interval: statsCfg.Interval, log: log}
+		go sr.Run(reconCtx)
+		log.Info("local stats reconciler started (rehydrates per-volume stats from the mount table across restarts)",
+			zap.Duration("interval", statsCfg.Interval))
+
 		if d.Metrics != nil {
 			if err := stats.RegisterCollector(d.Metrics.Registerer(), ctrl.metricsSnapshot, statsCfg.MetricsPerVolume, statsCfg.StaleAfter); err != nil {
 				return nil, driver.Internal("registering stats collector: %v", err)
@@ -202,25 +215,76 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 		}
 	}
 
-	// Log the discovered peer count once at startup (best-effort; non-fatal).
-	// Discovery is read-only — nothing to register — so there is no background
-	// registration loop.
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if peers, err := res.List(ctx); err != nil {
-			log.Warn("peer discovery: initial roster read failed; will retry on demand", zap.Error(err))
-		} else {
-			log.Info("peer discovery ready", zap.Int("peers", len(peers)))
-		}
-	}()
+	// Refresh the discovered-peer gauge on a ticker so nomad_csi_cluster_peers is
+	// correct after a restart — it is otherwise only updated on a forwarding op, so
+	// on an idle cluster it would read 0 until the next forward (state gauge fed by
+	// a background loop, per METRICS-RESTART-CONSISTENCY.PLAN.md §5). Read-only;
+	// also serves as the startup roster probe. When metrics are off there is no
+	// gauge, so we just log the initial count once.
+	if d.Metrics != nil {
+		peersCtx, cancel := context.WithCancel(context.Background())
+		b.stopPeers = cancel
+		go b.refreshPeersLoop(peersCtx, res, ctrl.cluster, log)
+	} else {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if peers, err := res.List(ctx); err != nil {
+				log.Warn("peer discovery: initial roster read failed; will retry on demand", zap.Error(err))
+			} else {
+				log.Info("peer discovery ready", zap.Int("peers", len(peers)))
+			}
+		}()
+	}
 
 	return b, nil
+}
+
+// defaultPeersRefreshInterval is how often the cluster_peers gauge is refreshed
+// from the resolver. Short relative to the resolver's own roster cache TTL, so a
+// tick is usually a cheap cache read, and well under a scrape interval.
+const defaultPeersRefreshInterval = 30 * time.Second
+
+// refreshPeersLoop periodically re-reads the peer roster and updates the
+// cluster_peers gauge, so the gauge self-heals after a restart instead of reading
+// 0 until the next forwarding op. It never touches resolve_total (that counts
+// forward-driven resolutions); a roster read error just leaves the gauge unchanged.
+func (b *backend) refreshPeersLoop(ctx context.Context, res cluster.Resolver, cm *metrics.ClusterMetrics, log *zap.Logger) {
+	b.refreshPeersOnce(ctx, res, cm, log) // startup probe + initial gauge value
+	t := time.NewTicker(defaultPeersRefreshInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			b.refreshPeersOnce(ctx, res, cm, log)
+		}
+	}
+}
+
+// refreshPeersOnce reads the roster once and sets the peers gauge on success; on
+// error it logs and leaves the gauge at its last value (never resets it to 0).
+func (b *backend) refreshPeersOnce(ctx context.Context, res cluster.Resolver, cm *metrics.ClusterMetrics, log *zap.Logger) {
+	rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if peers, err := res.List(rctx); err != nil {
+		log.Warn("peer discovery: roster read failed; cluster_peers gauge unchanged", zap.Error(err))
+		return
+	} else {
+		cm.SetPeers(len(peers))
+	}
 }
 
 // Shutdown stops the forwarding server. Peer discovery is read-only (nothing
 // was registered), so there is nothing to deregister.
 func (b *backend) Shutdown(ctx context.Context) error {
+	if b.stopReconcile != nil {
+		b.stopReconcile() // stop rehydration before tearing down the registry
+	}
+	if b.stopPeers != nil {
+		b.stopPeers() // stop the cluster_peers refresh loop
+	}
 	b.statsReg.Close() // stop per-volume stat workers + walk pool (non-blocking)
 	if b.queryS != nil {
 		_ = b.queryS.Close(ctx)

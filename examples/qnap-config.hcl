@@ -3,6 +3,12 @@
 # pass it with --config. Secrets live here, never on argv.
 
 qnap {
+  # REQUIRED for BOTH controller and node roles. The controller provisions LUNs;
+  # the node needs READ-ONLY SAN access to resolve iSCSI sessions to volume
+  # identities (per-volume stats rehydration across restarts + cold-cache
+  # teardown). The plugin refuses to start in node mode without these. NOTE: QNAP
+  # has no read-only API account, so the node holds the same full-power creds —
+  # scope their exposure accordingly.
   base_url = "https://qnap.example.com"
   username = "csi"
   password = "REDACTED"

@@ -254,6 +254,118 @@ func TestRegistry_RecoversViaRunLoop(t *testing.T) {
 	})
 }
 
+func TestRegistry_ReconcileRehydratesAndIsIdempotent(t *testing.T) {
+	r := newReg(t, dormantCfg())
+	r.statFn = okStatFn(mountutil.FSStats{TotalBytes: 1})
+
+	desired := []TrackSpec{
+		{VolumeID: "v1", StagingPath: "/s/v1", AccessType: AccessMount},
+		{VolumeID: "v2", StagingPath: "/s/v2", AccessType: AccessMount},
+		{VolumeID: "blk", StagingPath: "/dev/x", AccessType: AccessBlock},
+	}
+	// Simulates a post-restart sweep: the registry is empty, Reconcile rehydrates it
+	// from host truth with no re-stage.
+	if ev := r.Reconcile(desired, true, statsSweepGrace); len(ev) != 0 {
+		t.Fatalf("first reconcile evicted %v; want none", ev)
+	}
+	for _, id := range []string{"v1", "v2", "blk"} {
+		if _, ok := r.Get(id); !ok {
+			t.Fatalf("volume %q not tracked after reconcile", id)
+		}
+	}
+	if getWorker(r, "v1") == nil || getWorker(r, "blk") != nil {
+		t.Fatal("want a worker for the fs volume and none for the block volume")
+	}
+
+	// Idempotent: re-tracking keeps the SAME worker and updates the path.
+	w := getWorker(r, "v1")
+	r.Reconcile([]TrackSpec{{VolumeID: "v1", StagingPath: "/s/v1-new", AccessType: AccessMount}}, false, statsSweepGrace)
+	if getWorker(r, "v1") != w {
+		t.Fatal("re-track must keep the existing worker")
+	}
+	if p := w.getPath(); p != "/s/v1-new" {
+		t.Fatalf("worker path = %q; want the refreshed /s/v1-new", p)
+	}
+}
+
+func TestRegistry_ReconcileEvictsAfterGrace(t *testing.T) {
+	r := newReg(t, dormantCfg())
+	r.statFn = okStatFn(mountutil.FSStats{TotalBytes: 1})
+	r.Reconcile([]TrackSpec{
+		{VolumeID: "v1", StagingPath: "/s/v1", AccessType: AccessMount},
+		{VolumeID: "v2", StagingPath: "/s/v2", AccessType: AccessMount},
+	}, true, 2)
+
+	// v2 vanishes from the host. With a 2-sweep grace it must survive the first
+	// sweep (absorbs a stage/enumeration race) and only be evicted on the second.
+	onlyV1 := []TrackSpec{{VolumeID: "v1", StagingPath: "/s/v1", AccessType: AccessMount}}
+	if ev := r.Reconcile(onlyV1, true, 2); len(ev) != 0 {
+		t.Fatalf("sweep 1 evicted %v; grace should hold v2 one round", ev)
+	}
+	if _, ok := r.Get("v2"); !ok {
+		t.Fatal("v2 evicted during grace window; want retained")
+	}
+	if ev := r.Reconcile(onlyV1, true, 2); len(ev) != 1 || ev[0] != "v2" {
+		t.Fatalf("sweep 2 evicted %v; want [v2]", ev)
+	}
+	if _, ok := r.Get("v2"); ok {
+		t.Fatal("v2 should be evicted after two absent sweeps")
+	}
+	if getWorker(r, "v2") != nil {
+		t.Fatal("evicted volume's worker should be gone")
+	}
+}
+
+func TestRegistry_ReconcileGraceResetsOnReappear(t *testing.T) {
+	r := newReg(t, dormantCfg())
+	r.statFn = okStatFn(mountutil.FSStats{TotalBytes: 1})
+	full := []TrackSpec{
+		{VolumeID: "v1", StagingPath: "/s/v1", AccessType: AccessMount},
+		{VolumeID: "v2", StagingPath: "/s/v2", AccessType: AccessMount},
+	}
+	r.Reconcile(full, true, 2)
+	// v2 missing one sweep (grace started), then reappears — grace must reset so a
+	// later single-sweep absence does not immediately evict it.
+	r.Reconcile([]TrackSpec{full[0]}, true, 2) // v2 absent (count 1)
+	r.Reconcile(full, true, 2)                 // v2 back (reset)
+	if ev := r.Reconcile([]TrackSpec{full[0]}, true, 2); len(ev) != 0 {
+		t.Fatalf("evicted %v; grace should have reset on reappearance", ev)
+	}
+	if _, ok := r.Get("v2"); !ok {
+		t.Fatal("v2 wrongly evicted; grace counter did not reset")
+	}
+}
+
+func TestRegistry_ReconcileAddOnlyDoesNotEvict(t *testing.T) {
+	r := newReg(t, dormantCfg())
+	r.statFn = okStatFn(mountutil.FSStats{TotalBytes: 1})
+	r.Reconcile([]TrackSpec{{VolumeID: "v1", StagingPath: "/s/v1", AccessType: AccessMount}}, true, 1)
+
+	// A partial/failed host enumeration passes evict=false: even an empty desired
+	// set must not drop the live volume (add-only).
+	if ev := r.Reconcile(nil, false, 1); len(ev) != 0 {
+		t.Fatalf("add-only reconcile evicted %v; want none", ev)
+	}
+	if _, ok := r.Get("v1"); !ok {
+		t.Fatal("add-only reconcile must not evict a live volume")
+	}
+}
+
+func TestRegistry_ReconcileDisabledAndNilSafe(t *testing.T) {
+	var nilReg *Registry
+	if ev := nilReg.Reconcile([]TrackSpec{{VolumeID: "v"}}, true, 1); ev != nil {
+		t.Fatal("nil registry Reconcile should be a no-op")
+	}
+	off := newReg(t, Config{Enabled: false})
+	off.Reconcile([]TrackSpec{{VolumeID: "v", StagingPath: "/p", AccessType: AccessMount}}, true, 1)
+	if _, ok := off.Get("v"); ok {
+		t.Fatal("disabled registry Reconcile should not track")
+	}
+}
+
+// statsSweepGrace mirrors the local reconciler's grace for these unit tests.
+const statsSweepGrace = 2
+
 func TestRegistry_ConcurrentTrackUntrackRace(t *testing.T) {
 	r := newReg(t, dormantCfg())
 	r.statFn = okStatFn(mountutil.FSStats{TotalBytes: 1})

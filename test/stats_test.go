@@ -151,12 +151,25 @@ func TestIntegration_VolumeStats_QNAP(t *testing.T) {
 // --- stats query helpers ---
 
 // statsByID GETs the by-Nomad-id endpoint, returning the HTTP status and decoded
-// body (decoded for 200/503; empty otherwise).
+// body (decoded for 200/503; empty otherwise). Fails the test on a transport error
+// (use statsByIDErr inside a poll that must tolerate the server being briefly down).
 func (c *client) statsByID(t *testing.T, host, port, nomadID string) (int, stats.PublicVolumeStats) {
 	t.Helper()
+	code, cs, err := c.statsByIDErr(host, port, nomadID)
+	require.NoError(t, err, "GET http://%s:%s%s/%s", host, port, stats.QueryPathPrefix, nomadID)
+	return code, cs
+}
+
+// statsByIDErr is the soft variant of statsByID: it returns the transport error
+// instead of failing, so a poll can tolerate the query server being briefly
+// unreachable (a plugin restart bounces its :9610/:9611 listener, or a flaky
+// network drops a request). Status is 0 on a transport error.
+func (c *client) statsByIDErr(host, port, nomadID string) (int, stats.PublicVolumeStats, error) {
 	url := fmt.Sprintf("http://%s:%s%s/%s", host, port, stats.QueryPathPrefix, nomadID)
 	resp, err := scrapeHTTP.Get(url)
-	require.NoError(t, err, "GET %s", url)
+	if err != nil {
+		return 0, stats.PublicVolumeStats{}, err
+	}
 	defer func() { _ = resp.Body.Close() }()
 	var cs stats.PublicVolumeStats
 	if resp.StatusCode == 200 || resp.StatusCode == 503 {
@@ -164,7 +177,7 @@ func (c *client) statsByID(t *testing.T, host, port, nomadID string) (int, stats
 	} else {
 		_, _ = io.Copy(io.Discard, resp.Body)
 	}
-	return resp.StatusCode, cs
+	return resp.StatusCode, cs, nil
 }
 
 // statsList GETs the list endpoint on one host.

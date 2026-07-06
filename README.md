@@ -130,10 +130,14 @@ and become metric labels (see Observability). `--plugin-id` should match the Nom
 `csi_plugin { id = … }` for this deployment; `--node-id` is conventionally
 `${node.unique.name}`.
 
-- `qnap`: a process is `controller` (one per cluster/DC, sole talker to the
-  appliance) **xor** `node` (every client; iSCSI + multipath + format/mount).
-  `--parent-dataset` is **not used** by qnap (LUNs are named per-volume and
-  namespaced on the appliance).
+- `qnap`: a process is `controller` (one per cluster/DC, provisions LUNs on the
+  appliance) **xor** `node` (every client; iSCSI + multipath + format/mount). The
+  node **also needs read-only SAN credentials** (`qnap.base_url` / `username` /
+  `password`) to resolve iSCSI sessions to volume identities — for per-volume stats
+  rehydration across restarts and cold-cache teardown — so the plugin **refuses to
+  start in node mode without them** (QNAP has no read-only API account, so these are
+  the same creds the controller uses). `--parent-dataset` is **not used** by qnap
+  (LUNs are named per-volume and namespaced on the appliance).
 - `local`: `monolith` on every node under one `plugin_id`; controllers forward
   create/delete/expand/snapshot to the owning node (peer discovery via Nomad's
   `/v1/nodes` API over the task API socket — the plugin task needs an `identity`
@@ -219,7 +223,7 @@ curl -s localhost:9610/v1/volume-stats/local-data | jq  # per-volume usage by No
 
 ```sh
 nomad job run    examples/qnap-controller.nomad.hcl  # one controller (creds)
-nomad job run    examples/qnap-node.nomad.hcl         # node plugin, every node
+nomad job run    examples/qnap-node.nomad.hcl         # node plugin, every node (needs read-only SAN creds)
 nomad volume create examples/qnap-volume.hcl          # provision the LUN
 nomad job run    examples/qnap-consumer.nomad.hcl     # mount it, stay up
 nomad alloc exec -job qnap-consumer df -h /data       # verify the mount
@@ -386,6 +390,17 @@ data:
   examples set to `:9612` so it doesn't clash with a co-located local monolith's
   `:9602`); without `forward_secret`, qnap volumes still hydrate node-locally but
   are not centrally queryable.
+
+**Restart survival.** Nomad does **not** re-issue `NodeStageVolume` after a
+plugin-task restart, so the in-memory registry would otherwise stay empty and
+under-report every pre-restart volume. Each node therefore runs a **stats
+reconciler** that rebuilds the registry from **host truth** on startup + on a
+ticker (`interval`), with **no re-stage**: local reconstructs staged volumes from
+the ZFS zvol mount table; qnap enumerates live iSCSI sessions and resolves each to
+its volume identity via the **read-only SAN** (so the qnap node needs
+`base_url`/`username`/`password`; it refuses to start without them). Reconciliation
+is side-effect-free — it only tracks/untracks stats, never a mount or session — and
+is add-only on a transient enumeration/SAN error, so it cannot drop a live volume.
 
 **Resilience.** The subsystem degrades to *stale data* and never blocks the CSI
 RPC path: queries serve cached values, a hung `statfs`/`readdir` is abandoned by

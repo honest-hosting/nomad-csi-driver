@@ -29,10 +29,13 @@ type node struct {
 
 	// waitForPath polls until the device path exists; overridable in tests.
 	waitForPath func(ctx context.Context, path string) (string, error)
-	// zvolDevices returns this plugin's zvol device paths — the /dev/zvol/<pool>/
-	// <parentDataset>/* symlinks AND their resolved /dev/zdN targets — so a staged
-	// mount matches whichever form findmnt reports. Overridable in tests.
-	zvolDevices func() map[string]struct{}
+	// zvolDatasets maps this plugin's zvol device paths — the /dev/zvol/<pool>/
+	// <parentDataset>/* symlinks AND their resolved /dev/zdN targets — to the full
+	// zvol dataset (<pool>/<parent>/<vol>). A staged mount matches whichever form
+	// findmnt reports (StagedCount uses the key set); the dataset value lets the
+	// stats reconciler reconstruct the CSI volume id for rehydration. Overridable
+	// in tests.
+	zvolDatasets func() map[string]string
 }
 
 // StagedCount reports how many of THIS plugin's volumes are currently staged on
@@ -52,7 +55,7 @@ func (n *node) StagedCount(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	ourDevs := n.zvolDevices()
+	ourDevs := n.zvolDatasets()
 	seen := map[string]struct{}{}
 	for _, m := range mounts {
 		if _, ok := ourDevs[m.Source]; ok {
@@ -68,23 +71,74 @@ func (n *node) StagedCount(ctx context.Context) (int, error) {
 	return len(seen), nil
 }
 
-// osZvolDevices reads this plugin's zvol device set from /dev/zvol: for each
-// configured pool it lists the <pool>/<parentDataset>/ directory (one symlink per
-// zvol) and records both the symlink path and its resolved target, so StagedCount
-// matches a mount whether findmnt names the symlink or the /dev/zdN device.
-func (n *node) osZvolDevices() map[string]struct{} {
-	out := map[string]struct{}{}
+// stagedVolumes lists this plugin's currently-staged filesystem volumes from the
+// live mount table, as stats.TrackSpecs, so the stats registry can be rehydrated
+// after a plugin restart without waiting for a re-stage (which Nomad never issues
+// — see NOMAD-CSI-DRIVER-METRICS-RESTART-CONSISTENCY.PLAN.md §4.2). It mirrors
+// StagedCount's device-identity matching, but for each match it reconstructs the
+// CSI volume id (the registry key) and captures the staging path:
+//
+//   - VolumeID   = externalID{Node: this node, Dataset: <matched zvol dataset>}.
+//     The node is safe to assume as ours: the stage-time wrong-node guard refuses
+//     a stage on a non-owner, so any locally-staged zvol is owned here.
+//   - StagingPath = the mount target (where NodeStageVolume mounted the zvol).
+//   - AccessType  = "mount" — a filesystem staging mount is the only host artifact
+//     the mount table exposes. Local block is presence-only and staged block has
+//     no mount; a *published* block volume's bind-mount also has a zvol source, but
+//     block is not used in production and its rehydration is out of scope here
+//     (the same local-block blind spot the staged gauge documents).
+//
+// Deduped by volume id (a zvol is staged once). A ListMounts error is surfaced so
+// the caller stays add-only (never evicts on a transient enumeration failure).
+func (n *node) stagedVolumes(ctx context.Context) ([]stats.TrackSpec, error) {
+	mounts, err := n.mounter.ListMounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	devDatasets := n.zvolDatasets()
+	seen := map[string]struct{}{}
+	var out []stats.TrackSpec
+	for _, m := range mounts {
+		ds, ok := devDatasets[m.Source]
+		if !ok {
+			if real, err := filepath.EvalSymlinks(m.Source); err == nil {
+				ds, ok = devDatasets[real]
+			}
+		}
+		if !ok {
+			continue
+		}
+		id := externalID{Node: n.nodeID, Dataset: ds}.String()
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, stats.TrackSpec{VolumeID: id, StagingPath: m.Target, AccessType: stats.AccessMount})
+	}
+	return out, nil
+}
+
+// osZvolDatasets reads this plugin's zvol device→dataset map from /dev/zvol: for
+// each configured pool it lists the <pool>/<parentDataset>/ directory (one symlink
+// per zvol) and records BOTH the symlink path and its resolved target, each mapped
+// to the full dataset (<pool>/<parent>/<vol>). StagedCount uses the key set (match
+// a mount whether findmnt names the symlink or the /dev/zdN device); the stats
+// reconciler uses the dataset value to reconstruct the CSI volume id.
+func (n *node) osZvolDatasets() map[string]string {
+	out := map[string]string{}
 	for _, pool := range n.cfg.PoolNames() {
-		dir := zfs.DevicePath(parentDatasetForPool(n.cfg, pool, n.parentDataset))
+		parent := parentDatasetForPool(n.cfg, pool, n.parentDataset) // "<pool>/<parent>"
+		dir := zfs.DevicePath(parent)
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			continue // pool has no zvols yet, or dir not present
 		}
 		for _, e := range entries {
+			dataset := parent + "/" + e.Name()
 			p := filepath.Join(dir, e.Name())
-			out[p] = struct{}{}
+			out[p] = dataset
 			if real, err := filepath.EvalSymlinks(p); err == nil {
-				out[real] = struct{}{}
+				out[real] = dataset
 			}
 		}
 	}

@@ -49,13 +49,21 @@ metrics {
 # HTTP+JSON query API (GET /v1/volume-stats[/{nomad-volume-id}]) and as
 # nomad_csi_volume_* Prometheus gauges. ON by default — this whole block is
 # optional; the production defaults shown as comments apply when omitted.
+#
+# Restart survival: a reconciler rebuilds the registry from the zvol mount table on
+# startup + every `interval` (no re-stage needed), so ALL staged volumes resume
+# measurement after a plugin restart. On a fleet of large volumes (e.g. many-file
+# WordPress mounts) that means every volume resumes periodic tree walks — set
+# `walk_enabled = false` to keep only the cheap statfs bytes/inodes (a good staging
+# step for a rollout), or raise `walk_interval` to spread the I/O.
 stats {
   # enabled            = true    # master toggle (default on)
+  # walk_enabled       = true    # file/dir tree walk (default on); false = statfs-only, no walk I/O
   # query_addr         = ":9610" # query API listener; "" disables it
   # query_token        = ""      # require this token (header X-NCD-Query-Token);
   #                              # EMPTY/unset leaves the endpoint OPEN (no auth)
   # query_token_header = "X-NCD-Query-Token"
-  # interval           = "60s"   # statfs cadence (cheap)
+  # interval           = "60s"   # statfs + reconcile cadence (cheap)
   # walk_interval      = "5m"    # file/dir walk cadence (expensive)
   # walk_workers       = 4       # shared walk pool size (the IO ceiling)
   # walk_timeout       = "10m"   # per-volume walk deadline

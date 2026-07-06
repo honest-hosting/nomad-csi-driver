@@ -37,6 +37,20 @@ type Registry struct {
 	mu    sync.RWMutex
 	vols  map[string]*worker
 	cache map[string]CSIVolumeStats
+	// absent counts, per cached volume, how many consecutive Reconcile passes it
+	// has been missing from the desired set — the eviction grace (§4.4 of
+	// METRICS-RESTART-CONSISTENCY) so a volume staged concurrently with a sweep is
+	// not dropped on first sight. Guarded by mu.
+	absent map[string]int
+}
+
+// TrackSpec is one volume's rehydration identity: everything Track needs to begin
+// (or refresh) measuring it. Reconcile takes a slice of these, reconstructed from
+// host truth, so the registry survives a plugin restart without a re-stage.
+type TrackSpec struct {
+	VolumeID    string
+	StagingPath string
+	AccessType  string
 }
 
 // NewRegistry builds a node-side stats registry. It owns a backend-lifetime
@@ -58,6 +72,7 @@ func NewRegistry(cfg Config, node string, log *zap.Logger) *Registry {
 		cancel: cancel,
 		vols:   map[string]*worker{},
 		cache:  map[string]CSIVolumeStats{},
+		absent: map[string]int{},
 	}
 	if cfg.Enabled && cfg.WalkEnabled {
 		r.pool = newWalkPool(base, cfg.WalkWorkers)
@@ -106,6 +121,67 @@ func (r *Registry) Untrack(volumeID string) {
 	if w != nil {
 		w.cancel()
 	}
+}
+
+// Reconcile makes the tracked set match the host-derived desired set. It Tracks
+// every spec (idempotent — re-tracking keeps the worker and refreshes the path),
+// so a plugin restart rehydrates the registry from host truth with no re-stage.
+//
+// When evict is true it also Untracks any currently-cached volume absent from
+// desired — but only after it has been missing for graceSweeps consecutive
+// Reconcile calls, so a volume staged concurrently with the caller's host
+// enumeration is not dropped on first sight (it reappears next sweep). Callers
+// pass evict=false when the host enumeration failed or was partial, so a transient
+// error never drops live volumes (add-only). graceSweeps < 1 is treated as 1
+// (evict on first confirmed absence). Returns the volume IDs it evicted.
+//
+// Nil/disabled registry: no-op returning nil.
+func (r *Registry) Reconcile(desired []TrackSpec, evict bool, graceSweeps int) []string {
+	if r == nil || !r.cfg.Enabled {
+		return nil
+	}
+	want := make(map[string]struct{}, len(desired))
+	for _, d := range desired {
+		if d.VolumeID == "" {
+			continue
+		}
+		want[d.VolumeID] = struct{}{}
+		r.Track(d.VolumeID, d.StagingPath, d.AccessType) // idempotent; takes r.mu itself
+	}
+	if !evict {
+		return nil
+	}
+	if graceSweeps < 1 {
+		graceSweeps = 1
+	}
+
+	var toEvict []string
+	r.mu.Lock()
+	for id := range r.cache {
+		if _, ok := want[id]; ok {
+			delete(r.absent, id) // present again → reset its grace counter
+			continue
+		}
+		r.absent[id]++
+		if r.absent[id] >= graceSweeps {
+			toEvict = append(toEvict, id)
+		}
+	}
+	// Forget grace counters for volumes no longer cached (already gone).
+	for id := range r.absent {
+		if _, ok := r.cache[id]; !ok {
+			delete(r.absent, id)
+		}
+	}
+	r.mu.Unlock()
+
+	for _, id := range toEvict {
+		r.Untrack(id) // takes r.mu itself; also clears the cache entry
+		r.mu.Lock()
+		delete(r.absent, id)
+		r.mu.Unlock()
+	}
+	return toEvict
 }
 
 // Get returns the cached reading for a volume.
