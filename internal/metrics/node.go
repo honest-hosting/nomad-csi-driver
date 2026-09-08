@@ -14,6 +14,7 @@ type NodeMetrics struct {
 	mountTotal    *prometheus.CounterVec   // {op, outcome}
 	mountDuration *prometheus.HistogramVec // {op}
 	formatSkipped prometheus.Counter
+	ctxRebuilt    *prometheus.CounterVec // {field}
 }
 
 // NewNodeMetrics registers the node collectors on reg (the identity-wrapping
@@ -32,8 +33,12 @@ func NewNodeMetrics(reg prometheus.Registerer) *NodeMetrics {
 			Namespace: "nomad_csi", Subsystem: "node", Name: "format_skipped_total",
 			Help: "Times an existing filesystem was found and mkfs was skipped (idempotency safety signal).",
 		}),
+		ctxRebuilt: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "nomad_csi", Subsystem: "node", Name: "volume_context_reconstructed_total",
+			Help: "Volume-context fields rebuilt from the volume's external id because Nomad delivered the context empty. Non-zero means `nomad volume create` was run against an ALREADY-EXISTING volume: Nomad skips the plugin on that path and (before 1.9.6 / hashicorp/nomad#24922) erases the stored context. Should stay at zero on Nomad >= 1.9.6. A block volume can rebuild at both stage and publish, so counts are per field-resolution, not per volume.",
+		}, []string{"field"}),
 	}
-	reg.MustRegister(m.mountTotal, m.mountDuration, m.formatSkipped)
+	reg.MustRegister(m.mountTotal, m.mountDuration, m.formatSkipped, m.ctxRebuilt)
 	return m
 }
 
@@ -53,6 +58,16 @@ func (m *NodeMetrics) MountOp(op, outcome string, dur time.Duration) {
 func (m *NodeMetrics) FormatSkipped() {
 	if m != nil {
 		m.formatSkipped.Inc()
+	}
+}
+
+// VolumeContextReconstructed records one volume-context field that had to be
+// rebuilt from the volume's external id. Callers pass the context key they
+// recovered (e.g. "dataset", "node", "iqn"), so the label says which part of the
+// context Nomad dropped.
+func (m *NodeMetrics) VolumeContextReconstructed(field string) {
+	if m != nil {
+		m.ctxRebuilt.WithLabelValues(field).Inc()
 	}
 }
 

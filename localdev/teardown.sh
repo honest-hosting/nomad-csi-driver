@@ -15,11 +15,30 @@ LOCAL_ID="${LOCAL_INTEGRATION_PLUGIN_ID:-nomad-csi-driver-local}"
 echo "[teardown] stopping consuming workloads"
 nomad job stop -purge "ncd-e2e-consumer" >/dev/null 2>&1 || true
 
-echo "[teardown] deleting ncd-e2e-* volumes (controllers still up)"
-nomad volume status 2>/dev/null | awk '/^ncd-e2e-/{print $1}' | while read -r v; do
-  [ -n "$v" ] || continue
-  nomad volume delete "$v" >/dev/null 2>&1 || true
+# Every suite in test/ names its volumes ncd-<something>: ncd-e2e-, ncd-ctx-,
+# ncd-stats-, ncd-obs-, ncd-noleak-, ncd-recon-, ncd-restart-, ... Matching only
+# one suite's prefix orphaned the rest — and once the plugin jobs are purged below
+# there is no controller left to delete them, so they survive until the plugins
+# are redeployed. Match the shared prefix instead.
+echo "[teardown] deleting ncd-* volumes (controllers still up)"
+remaining=""
+for _attempt in 1 2 3; do
+  remaining=""
+  while read -r v; do
+    [ -n "$v" ] || continue
+    nomad volume delete "$v" >/dev/null 2>&1 || remaining="${remaining} ${v}"
+  done < <(nomad volume status 2>/dev/null | awk '/^ncd-/{print $1}')
+  [ -n "${remaining# }" ] || break
+  # A claim released by the job stop above can take a few seconds to clear, and a
+  # volume is undeletable until it does. Retry before reporting it as stuck.
+  sleep 5
 done
+if [ -n "${remaining# }" ]; then
+  echo "[teardown] WARNING: could not delete:${remaining}"
+  echo "[teardown]   still claimed, or its controller is unreachable. Check with"
+  echo "[teardown]   'nomad volume status <id>'. The plugin purge below removes the"
+  echo "[teardown]   controllers, so redeploy them before retrying the delete."
+fi
 
 echo "[teardown] purging plugin jobs"
 nomad job stop -purge "$LOCAL_ID"                        >/dev/null 2>&1 || true

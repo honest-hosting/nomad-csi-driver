@@ -152,6 +152,7 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 			mounter:       mountutil.New(d.Runner, log).WithMetrics(nm),
 			log:           log,
 			stats:         statsReg,
+			nodeMetrics:   nm,
 			waitForPath:   osWaitForPath(devAppearTimeout),
 		},
 		z:        z,

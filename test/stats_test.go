@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"testing"
 	"time"
 
@@ -32,20 +33,18 @@ import (
 	"github.com/honest-hosting/nomad-csi-driver/internal/stats"
 )
 
-// TestIntegration_VolumeStats_Local drives the local backend: it creates a
+// TestIntegrationLocal_VolumeStats drives the local backend: it creates a
 // node-pinned volume, mounts it, and asserts the stats API reports its usage
 // (statfs bytes + the directory walk), the per-volume metric is exposed, and the
 // reading is evicted on unstage. The by-id lookup is issued to an arbitrary
 // monolith to exercise the forward-to-owner path.
-func TestIntegration_VolumeStats_Local(t *testing.T) {
+func TestIntegrationLocal_VolumeStats(t *testing.T) {
 	c := newClient(t)
 	c.requirePluginHealthy(t, c.localPluginID, 1, false)
 
 	port := envOr("STATS_QUERY_PORT", "9610")
 	hosts := c.reachableMetricsHosts(t, port, stats.QueryPathPrefix) // skips if none answer
 	t.Logf("volume-stats(local): querying %d endpoint(s) on :%s%s -> %v", len(hosts), port, stats.QueryPathPrefix, hosts)
-
-	baseCount := c.statsListCount(t, hosts, port)
 
 	node := c.pickNode(t)
 	volID := fmt.Sprintf("ncd-stats-%d", time.Now().UnixNano())
@@ -73,9 +72,13 @@ func TestIntegration_VolumeStats_Local(t *testing.T) {
 	require.Greater(t, got.AvailableBytes, int64(0), "a mounted ext4 fs has free space")
 	require.Empty(t, got.LastError, "a healthy mount should have no error")
 
-	// The owning monolith's list grew by exactly one volume.
-	require.Equal(t, baseCount+1, c.statsListCount(t, hosts, port),
-		"summed volume-stats list should rise by 1 after a stage")
+	// The owning monolith's list includes this volume. Membership, not a +1 delta
+	// on the cluster-wide total: that total also moves when anything ELSE stages or
+	// unstages during the test (another workload, or the stats reconciler evicting
+	// a recently-unstaged volume after its grace sweeps), which made this flaky on
+	// a busy cluster while asserting nothing the membership check doesn't.
+	require.Contains(t, c.statsListIDs(t, hosts, port), volID,
+		"the staged volume should appear in the summed volume-stats list")
 
 	// The directory walk completes; a freshly-formatted ext4 fs has lost+found.
 	c.poll(t, "volume stats walk completes", 3*time.Minute, func() bool {
@@ -93,17 +96,17 @@ func TestIntegration_VolumeStats_Local(t *testing.T) {
 	// Unstage evicts the reading.
 	c.stopConsumer(t, volID)
 	c.poll(t, "volume stats evicted after unstage", 2*time.Minute, func() bool {
-		return c.statsListCount(t, hosts, port) == baseCount
+		return !slices.Contains(c.statsListIDs(t, hosts, port), volID)
 	})
 
 	c.requireVolumeDeleted(t, volID)
 }
 
-// TestIntegration_VolumeStats_QNAP drives the qnap backend: it creates a LUN,
+// TestIntegrationQNAP_VolumeStats drives the qnap backend: it creates a LUN,
 // mounts it, and asserts the controller's aggregated stats report its usage.
 // It SKIPS when the qnap controller query endpoint is not reachable (no
 // appliance, or forward_secret/query_addr not configured).
-func TestIntegration_VolumeStats_QNAP(t *testing.T) {
+func TestIntegrationQNAP_VolumeStats(t *testing.T) {
 	c := newClient(t)
 	c.requirePluginHealthy(t, c.qnapPluginID, 1, true) // optional: skips if not deployed
 
@@ -194,15 +197,19 @@ func (c *client) statsList(t *testing.T, host, port string) []stats.PublicVolume
 	return out
 }
 
-// statsListCount sums the list length across every host (local: each monolith
-// reports its own node's volumes, so the sum is the cluster total).
-func (c *client) statsListCount(t *testing.T, hosts []string, port string) int {
+// statsListIDs collects the volume ids reported across every host (local: each
+// monolith reports its own node's volumes, so the union is the cluster set).
+// Callers assert on membership rather than on the count, so a volume staged or
+// unstaged by something else mid-test cannot move the result.
+func (c *client) statsListIDs(t *testing.T, hosts []string, port string) []string {
 	t.Helper()
-	total := 0
+	var ids []string
 	for _, h := range hosts {
-		total += len(c.statsList(t, h, port))
+		for _, vs := range c.statsList(t, h, port) {
+			ids = append(ids, vs.ID)
+		}
 	}
-	return total
+	return ids
 }
 
 // volMetricSum sums a per-volume gauge family across hosts, best-effort (a host

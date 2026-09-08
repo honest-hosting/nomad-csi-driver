@@ -16,15 +16,15 @@ import (
 // IDENTICALLY against both backends so the two are easy to compare stage by
 // stage. Each stage is its own subtest, so a run reads as a checklist:
 //
-//	TestIntegration_Local/01_create
-//	TestIntegration_Local/02_mount
-//	TestIntegration_Local/03_read_write
-//	TestIntegration_Local/04_snapshot_restore
-//	TestIntegration_Local/05_clone
-//	TestIntegration_Local/06_expand          (skips on Nomad < 1.8.0)
-//	TestIntegration_Local/07_persist_across_remount
-//	TestIntegration_Local/08_delete
-//	TestIntegration_QNAP/01_create ...
+//	TestIntegrationLocal_Lifecycle/01_create
+//	TestIntegrationLocal_Lifecycle/02_mount
+//	TestIntegrationLocal_Lifecycle/03_read_write
+//	TestIntegrationLocal_Lifecycle/04_snapshot_restore
+//	TestIntegrationLocal_Lifecycle/05_clone
+//	TestIntegrationLocal_Lifecycle/06_expand          (skips on Nomad < 1.8.0)
+//	TestIntegrationLocal_Lifecycle/07_persist_across_remount
+//	TestIntegrationLocal_Lifecycle/08_delete
+//	TestIntegrationQNAP_Lifecycle/01_create ...
 //
 // This is the single source of lifecycle coverage for BOTH --driver values; the
 // old in-process QNAP controller tests were retired in favor of driving the real
@@ -71,13 +71,13 @@ func qnapBackend(c *client) backend {
 	}
 }
 
-func TestIntegration_Local(t *testing.T) {
+func TestIntegrationLocal_Lifecycle(t *testing.T) {
 	c := newClient(t)
 	c.requirePluginHealthy(t, c.localPluginID, 1, false)
 	runLifecycle(t, c, localBackend(c))
 }
 
-func TestIntegration_QNAP(t *testing.T) {
+func TestIntegrationQNAP_Lifecycle(t *testing.T) {
 	c := newClient(t)
 	// Optional: skips cleanly where no QNAP appliance/plugin is deployed.
 	c.requirePluginHealthy(t, c.qnapPluginID, 1, true)

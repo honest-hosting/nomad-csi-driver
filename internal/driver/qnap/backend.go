@@ -133,6 +133,7 @@ func New(_ context.Context, d driver.Deps) (driver.Backend, error) {
 			metrics:      qnm,
 			stats:        b.statsReg,
 			san:          newNodeSANCache(cfg, d, log), // tier-3 cold-block identity; nil when no SAN creds
+			nodeMetrics:  nm,
 			holdersFn:    deviceHasHolders,
 			waitForPath:  osWaitForPath(devAppearTimeout),
 		}

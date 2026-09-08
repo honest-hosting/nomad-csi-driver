@@ -10,6 +10,7 @@ import (
 
 	"github.com/honest-hosting/nomad-csi-driver/internal/config"
 	"github.com/honest-hosting/nomad-csi-driver/internal/driver"
+	"github.com/honest-hosting/nomad-csi-driver/internal/metrics"
 	"github.com/honest-hosting/nomad-csi-driver/internal/mountutil"
 	"github.com/honest-hosting/nomad-csi-driver/internal/stats"
 	"github.com/honest-hosting/nomad-csi-driver/internal/zfs"
@@ -25,7 +26,8 @@ type node struct {
 	parentDataset string // the "<pool>/<parentDataset>/<vol>" middle segment; scopes StagedCount
 	mounter       *mountutil.Mounter
 	log           *zap.Logger
-	stats         *stats.Registry // per-volume usage stats; nil-safe no-op when disabled
+	stats         *stats.Registry      // per-volume usage stats; nil-safe no-op when disabled
+	nodeMetrics   *metrics.NodeMetrics // shared node collectors; nil-safe (records context rebuilds)
 
 	// waitForPath polls until the device path exists; overridable in tests.
 	waitForPath func(ctx context.Context, path string) (string, error)
@@ -145,20 +147,72 @@ func (n *node) osZvolDatasets() map[string]string {
 	return out
 }
 
+// resolveVolumeIdentity returns the volume's dataset and owning node.
+//
+// Both normally arrive in the volume context that CreateVolume returned. Nomad
+// can hand it back EMPTY: `nomad volume create` against a volume that already
+// exists never calls the plugin at all (the server merges the submitted spec
+// instead), and before Nomad 1.9.6 that merge assigned the spec's context
+// unconditionally — a create spec carries no context block, so the stored
+// context was replaced with nothing. See hashicorp/nomad#24922 and
+// specs/nomad-csi-driver/NOMAD-CSI-DRIVER-MISSING-CTX-FIX.PLAN.md.
+//
+// The volume's data is untouched in that state, so refusing to mount would be an
+// outage over bookkeeping. The external id encodes both values, Nomad refuses to
+// let it change ("volume external ID cannot be updated"), and it is handed to
+// every node RPC — so rebuild from it. This recomputes what the context held
+// rather than guessing, and matches how DeleteVolume already resolves a volume.
+func (n *node) resolveVolumeIdentity(volumeID string, vctx map[string]string) (string, string, error) {
+	dataset, owner := vctx[ctxKeyDataset], vctx[ctxKeyNode]
+	if dataset != "" && owner != "" {
+		return dataset, owner, nil
+	}
+
+	eid, err := parseExternalID(volumeID)
+	if err != nil {
+		return "", "", driver.InvalidArgument(
+			"volume context is missing %q and volume id %q cannot be parsed to recover it: %v",
+			ctxKeyDataset, volumeID, err)
+	}
+
+	rebuilt := make([]string, 0, 2)
+	if dataset == "" {
+		dataset = eid.Dataset
+		rebuilt = append(rebuilt, ctxKeyDataset)
+	}
+	if owner == "" {
+		owner = eid.Node
+		rebuilt = append(rebuilt, ctxKeyNode)
+	}
+	for _, field := range rebuilt {
+		n.nodeMetrics.VolumeContextReconstructed(field)
+	}
+	n.log.Warn("volume context incomplete; rebuilt from external id",
+		zap.String("volume_id", volumeID),
+		zap.Strings("rebuilt_fields", rebuilt),
+		zap.String("dataset", dataset),
+		zap.String("owner_node", owner),
+		zap.String("likely_cause", "`nomad volume create` run against an existing volume; Nomad < 1.9.6 erases volume context on update (hashicorp/nomad#24922)"))
+	return dataset, owner, nil
+}
+
 func (n *node) StageVolume(ctx context.Context, req *driver.StageRequest) (err error) {
 	defer func() {
 		if err == nil {
 			n.stats.Track(req.VolumeID, req.StagingTargetPath, stageAccessType(req.VolumeCapability.AccessType))
 		}
 	}()
-	// Wrong-node guard (data safety): a stage that lands on a non-owner node must
-	// refuse rather than risk materializing a second, empty zvol.
-	if owner := req.VolumeContext[ctxKeyNode]; owner != "" && owner != n.nodeID {
-		return driver.FailedPrecondition("volume %s is owned by node %q but staged on %q", req.VolumeID, owner, n.nodeID)
+	dataset, owner, err := n.resolveVolumeIdentity(req.VolumeID, req.VolumeContext)
+	if err != nil {
+		return err
 	}
-	dataset := req.VolumeContext[ctxKeyDataset]
-	if dataset == "" {
-		return driver.InvalidArgument("volume context missing dataset")
+	// Wrong-node guard (data safety): a stage that lands on a non-owner node must
+	// refuse rather than risk materializing a second, empty zvol. Resolving the
+	// owner FIRST also closes a latent hole: this used to read the owner straight
+	// from the volume context and skip the check entirely when that key was empty,
+	// which is exactly the state a context wipe leaves behind.
+	if owner != n.nodeID {
+		return driver.FailedPrecondition("volume %s is owned by node %q but staged on %q", req.VolumeID, owner, n.nodeID)
 	}
 	// Checkpoint 3: the volume's pool must still be present + ONLINE on this node
 	// (it may have been exported, or the node reimaged, since create). Probe for a
@@ -184,6 +238,27 @@ func (n *node) StageVolume(ctx context.Context, req *driver.StageRequest) (err e
 	fsType := req.VolumeContext[ctxKeyFsType]
 	if fsType == "" {
 		fsType = req.VolumeCapability.FsType
+	}
+	if fsType == "" {
+		// Third fallback, for the same context-wipe case as resolveVolumeIdentity.
+		// Nomad only populates the capability's fs_type from the volume spec's
+		// mount_options.fs_type, which most specs omit — so once the context is
+		// erased there is no declared filesystem left anywhere. Both callers below
+		// need one: FormatIfEmpty would see the existing ext4, compare it against
+		// "" and REFUSE ("already carries filesystem ext4, refusing to format as
+		// ..."), and Mount would shell out to `mount -t "" ...`.
+		//
+		// The zvol is already formatted, so ask the device instead of guessing. That
+		// is authoritative rather than inferred, and it cannot mis-format: this only
+		// ever reports a filesystem that is already there.
+		if detected, derr := n.mounter.DetectFilesystem(ctx, dev); derr == nil && detected != "" {
+			fsType = detected
+			n.nodeMetrics.VolumeContextReconstructed(ctxKeyFsType)
+			n.log.Warn("volume context has no fsType and the capability declares none; probed the device",
+				zap.String("volume_id", req.VolumeID),
+				zap.String("device", dev),
+				zap.String("detected_fstype", fsType))
+		}
 	}
 	if _, err := n.mounter.FormatIfEmpty(ctx, dev, fsType, nil); err != nil {
 		return driver.Internal("format: %v", err)
@@ -213,7 +288,13 @@ func stageAccessType(at driver.AccessType) string {
 
 func (n *node) PublishVolume(ctx context.Context, req *driver.PublishRequest) error {
 	if req.VolumeCapability.AccessType == driver.AccessTypeBlock {
-		dataset := req.VolumeContext[ctxKeyDataset]
+		// Same rebuild as StageVolume: this path read the dataset straight from the
+		// context with no empty check at all, so a wiped context produced a bare
+		// device-not-found from waitForPath instead of a diagnosable error.
+		dataset, _, err := n.resolveVolumeIdentity(req.VolumeID, req.VolumeContext)
+		if err != nil {
+			return err
+		}
 		dev, err := n.waitForPath(ctx, zfs.DevicePath(dataset))
 		if err != nil {
 			return driver.Internal("zvol device did not appear: %v", err)

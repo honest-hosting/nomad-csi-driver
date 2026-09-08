@@ -16,7 +16,7 @@ import (
 // create/delete to the owning node. These verify the L4 coordination layer:
 // pinning, purge/rerun re-pinning, host=auto, pool selection, and forwarded
 // delete. (qnap is node-mobile, so none of this is meaningful for it.)
-func TestIntegration_LocalPlacement(t *testing.T) {
+func TestIntegrationLocal_Placement(t *testing.T) {
 	c := newClient(t)
 	c.requirePluginHealthy(t, c.localPluginID, 2, false)
 

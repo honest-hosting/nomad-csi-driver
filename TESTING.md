@@ -40,6 +40,22 @@ reachable, **bails** otherwise — no localhost ZFS checks) then `go test
 `NOMAD_ADDR` is unset (so a bare `go test -tags=integration` is safe) and **fails
 fast** if the local plugin isn't deployed.
 
+### Running one backend only
+
+Every e2e test is named `TestIntegration<Backend>_<Area>`, so a backend is
+selectable with a single `-run` prefix. This matters when only one backend is
+available — e.g. an expired QNAP licence, or a change that only touches local:
+
+```bash
+go test -tags=integration -run '^TestIntegrationLocal_'  ./test/...   # local only
+go test -tags=integration -run '^TestIntegrationQNAP_'   ./test/...   # qnap only
+go test -tags=integration -run '^TestIntegrationLocal_VolumeContext_' ./test/...
+```
+
+The qnap tests already self-skip when no appliance/plugin is deployed
+(`requirePluginHealthy(..., optional=true)`), so a full run stays green without
+QNAP — selecting by prefix additionally avoids spending the time on them.
+
 Cluster prerequisites, env vars (`NOMAD_TOKEN`, `NOMAD_SKIP_VERIFY`, `NOMAD_CSI_INTEGRATION_IMAGE`,
 `LOCAL_INTEGRATION_POOL1`, `LOCAL_INTEGRATION_PLUGIN_ID`), and how to build/push the plugin image (`make
 package`) are in [`../localdev/README.md`](../localdev/README.md).
@@ -52,7 +68,7 @@ the **local** monolith (`localdev/csi-local.nomad.hcl`) and, when
 a count-1 service controller (`csi-qnap-controller.nomad.hcl`) and a system
 daemonset node (`csi-qnap-node.nomad.hcl`) sharing one plugin_id.
 
-### The Nomad e2e (`TestIntegration_NomadCluster`)
+### The Nomad e2e (`TestIntegrationLocal_Lifecycle`)
 
 Assumes the local plugin is deployed + healthy, then validates the behaviors only
 Nomad can show for the **local** backend: topology pinning to the owning node,
@@ -86,7 +102,7 @@ Run it directly (it needs no Nomad cluster, so don't go through
 ```bash
 QNAP_INTEGRATION_URL=https://qnap.example.com QNAP_INTEGRATION_USER=admin \
 QNAP_INTEGRATION_PASSWORD=... QNAP_INTEGRATION_POOL_ID=1 QNAP_INTEGRATION_IFACES=eth0 \
-go test -tags=integration -run '^TestIntegration_QNAP' ./internal/driver/qnap/...
+go test -tags=integration -run '^TestIntegrationQNAP' ./internal/driver/qnap/...
 ```
 
 ### Early integration spikes (see NOMAD-CSI-DRIVER-ARCHITECTURE.md §10)
