@@ -40,11 +40,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestIntegration_Observability_Local exercises the local backend's metrics over
+// TestIntegrationLocal_Observability exercises the local backend's metrics over
 // a full create→mount→unmount→delete cycle, asserting the summed gauges/counters
 // move, plus a deliberate bad-pool create to prove the RPC error counter
 // increments (failure domain).
-func TestIntegration_Observability_Local(t *testing.T) {
+func TestIntegrationLocal_Observability(t *testing.T) {
 	c := newClient(t)
 	c.requirePluginHealthy(t, c.localPluginID, 1, false)
 
@@ -114,12 +114,12 @@ func TestIntegration_Observability_Local(t *testing.T) {
 	})
 }
 
-// TestIntegration_Observability_QNAP exercises the qnap backend's metrics across
+// TestIntegrationQNAP_Observability exercises the qnap backend's metrics across
 // a create→mount→unmount→delete cycle. qnap is two separate processes on two
 // ports — the controller (talks to the appliance) and the per-node plugin (iSCSI
 // + mount) — so it scrapes both and asserts each side's families move. Optional:
 // skips cleanly where no qnap appliance/plugin is deployed.
-func TestIntegration_Observability_QNAP(t *testing.T) {
+func TestIntegrationQNAP_Observability(t *testing.T) {
 	c := newClient(t)
 	c.requirePluginHealthy(t, c.qnapPluginID, 1, true)
 

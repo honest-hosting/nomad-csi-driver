@@ -15,6 +15,7 @@ import (
 	"github.com/honest-hosting/nomad-csi-driver/internal/config"
 	"github.com/honest-hosting/nomad-csi-driver/internal/driver"
 	"github.com/honest-hosting/nomad-csi-driver/internal/iscsi"
+	"github.com/honest-hosting/nomad-csi-driver/internal/metrics"
 	"github.com/honest-hosting/nomad-csi-driver/internal/mountutil"
 	"github.com/honest-hosting/nomad-csi-driver/internal/multipath"
 	"github.com/honest-hosting/nomad-csi-driver/internal/stats"
@@ -31,9 +32,10 @@ type node struct {
 	meta         metaStore
 	useMultipath bool
 	log          *zap.Logger
-	metrics      *qnapNodeMetrics  // qnap-specific (login/stage/rescan/device); nil-safe
-	stats        *stats.Registry   // per-volume usage stats; nil-safe no-op when disabled
-	san          *sanIdentityCache // read-only SAN identity resolver for cold-cache block teardown (tier 3); nil = degrade open
+	metrics      *qnapNodeMetrics     // qnap-specific (login/stage/rescan/device); nil-safe
+	stats        *stats.Registry      // per-volume usage stats; nil-safe no-op when disabled
+	san          *sanIdentityCache    // read-only SAN identity resolver for cold-cache block teardown (tier 3); nil = degrade open
+	nodeMetrics  *metrics.NodeMetrics // shared node collectors; nil-safe (records volume-context rebuilds)
 
 	// waitForPath polls until path exists and returns its resolved real path.
 	// Overridable in tests; defaults to an os-backed poller.
@@ -211,7 +213,7 @@ func (n *node) StageVolume(ctx context.Context, req *driver.StageRequest) (err e
 			n.stats.Track(req.VolumeID, req.StagingTargetPath, stageAccessType(req.VolumeCapability.AccessType))
 		}
 	}()
-	dev, meta, err := n.attach(ctx, req.VolumeContext)
+	dev, meta, err := n.attach(ctx, req.VolumeID, req.VolumeContext)
 	if err != nil {
 		return err
 	}
@@ -441,7 +443,7 @@ func (n *node) lastLUNOnTarget(ctx context.Context, iqn string, lun int) bool {
 
 func (n *node) PublishVolume(ctx context.Context, req *driver.PublishRequest) error {
 	if req.VolumeCapability.AccessType == driver.AccessTypeBlock {
-		dev, _, err := n.attach(ctx, req.VolumeContext)
+		dev, _, err := n.attach(ctx, req.VolumeID, req.VolumeContext)
 		if err != nil {
 			return err
 		}
@@ -621,10 +623,108 @@ func splitPortals(s string) []string {
 	return out
 }
 
+// resolveAttachIdentity returns the portals, target IQN and LUN number needed to
+// log in, rebuilding whichever of them the volume context is missing.
+//
+// Nomad can deliver the volume context EMPTY: `nomad volume create` against an
+// already-existing volume never calls the plugin, and before Nomad 1.9.6 the
+// server's spec merge erased the stored context (hashicorp/nomad#24922). The LUN
+// is untouched in that state, so rebuild rather than refuse. See
+// specs/nomad-csi-driver/NOMAD-CSI-DRIVER-MISSING-CTX-FIX.PLAN.md.
+//
+// Unlike the local backend, not every field is recoverable:
+//   - iqn: from the SAN via the external id, with resolveIQN's LUN-name check
+//     guarding against QNAP's index reuse. Always available — the node's
+//     read-only SAN client is mandatory in node mode.
+//   - portal: only from this node's own qnap.portals config. The node normally
+//     has NONE configured (it reads portals from each volume's context), so this
+//     is the one field that can fail to rebuild; the error says so explicitly.
+//   - lun: 0 for a 1:1 target, which the external id's ownTarget flag identifies.
+//     For a shared (1:N) target the LUN number is encoded nowhere and is NOT
+//     guessed — guessing 0 would attach the WRONG DEVICE.
+func (n *node) resolveAttachIdentity(ctx context.Context, volumeID string, vctx map[string]string) ([]string, string, int, error) {
+	portals := splitPortals(vctx[ctxKeyPortal])
+	iqn := vctx[ctxKeyIQN]
+	lunRaw := strings.TrimSpace(vctx[ctxKeyLUNNumber])
+
+	if len(portals) > 0 && iqn != "" && lunRaw != "" {
+		lun, err := strconv.Atoi(lunRaw)
+		if err != nil {
+			return nil, "", 0, driver.InvalidArgument("volume context has a non-numeric %q (%q): %v", ctxKeyLUNNumber, lunRaw, err)
+		}
+		return portals, iqn, lun, nil
+	}
+
+	eid, err := parseExternalID(volumeID)
+	if err != nil {
+		return nil, "", 0, driver.InvalidArgument(
+			"volume context is missing portal/iqn/lun and volume id %q cannot be parsed to recover them: %v", volumeID, err)
+	}
+
+	rebuilt := make([]string, 0, 3)
+
+	if iqn == "" {
+		if n.san == nil {
+			return nil, "", 0, driver.FailedPrecondition(
+				"volume %s has no %q in its volume context and no read-only SAN client is configured to recover it",
+				volumeID, ctxKeyIQN)
+		}
+		resolved, ok := n.san.resolveIQN(ctx, eid)
+		if !ok {
+			return nil, "", 0, driver.FailedPrecondition(
+				"volume %s has no %q in its volume context and the SAN could not resolve the target IQN for LUN index %d (the LUN may have been deleted, or its name no longer matches)",
+				volumeID, ctxKeyIQN, eid.LUNIndex)
+		}
+		iqn = resolved
+		rebuilt = append(rebuilt, ctxKeyIQN)
+	}
+
+	if len(portals) == 0 {
+		for _, p := range n.cfg.PortalList() {
+			if np := normalizePortal(p); np != "" {
+				portals = append(portals, np)
+			}
+		}
+		if len(portals) == 0 {
+			return nil, "", 0, driver.FailedPrecondition(
+				"volume %s has no %q in its volume context and this node has no qnap.portals configured to rebuild it from; set qnap.portals on the node, or restore the volume context with `nomad volume register`",
+				volumeID, ctxKeyPortal)
+		}
+		rebuilt = append(rebuilt, ctxKeyPortal)
+	}
+
+	lun := 0
+	switch {
+	case lunRaw != "":
+		if lun, err = strconv.Atoi(lunRaw); err != nil {
+			return nil, "", 0, driver.InvalidArgument("volume context has a non-numeric %q (%q): %v", ctxKeyLUNNumber, lunRaw, err)
+		}
+	case eid.OwnTarget:
+		// 1:1 target — the controller maps the LUN at iSCSI LUN 0.
+		rebuilt = append(rebuilt, ctxKeyLUNNumber)
+	default:
+		return nil, "", 0, driver.FailedPrecondition(
+			"volume %s has no %q in its volume context and its target is shared (1:N), so the LUN number cannot be derived from the volume id; restore the volume context with `nomad volume register`",
+			volumeID, ctxKeyLUNNumber)
+	}
+
+	for _, field := range rebuilt {
+		n.nodeMetrics.VolumeContextReconstructed(field)
+	}
+	n.log.Warn("volume context incomplete; rebuilt from external id + SAN",
+		zap.String("volume_id", volumeID),
+		zap.Strings("rebuilt_fields", rebuilt),
+		zap.String("iqn", iqn),
+		zap.Strings("portals", portals),
+		zap.Int("lun", lun),
+		zap.String("likely_cause", "`nomad volume create` run against an existing volume; Nomad < 1.9.6 erases volume context on update (hashicorp/nomad#24922)"))
+	return portals, iqn, lun, nil
+}
+
 // attach logs into the target and resolves the usable block device (multipath
 // mapper device, or the raw SCSI disk if multipath is disabled), returning the
 // device path and the metadata needed to detach later.
-func (n *node) attach(ctx context.Context, vctx map[string]string) (devOut string, metaOut stageMeta, err error) {
+func (n *node) attach(ctx context.Context, volumeID string, vctx map[string]string) (devOut string, metaOut stageMeta, err error) {
 	// Record exactly one stage outcome: failed (any error), degraded (fewer
 	// active paths than configured portals), or ok.
 	var degraded bool
@@ -639,12 +739,10 @@ func (n *node) attach(ctx context.Context, vctx map[string]string) (devOut strin
 		}
 	}()
 
-	portals := splitPortals(vctx[ctxKeyPortal])
-	iqn := vctx[ctxKeyIQN]
-	if len(portals) == 0 || iqn == "" {
-		return "", stageMeta{}, driver.InvalidArgument("volume context missing portal/iqn")
+	portals, iqn, lunNum, err := n.resolveAttachIdentity(ctx, volumeID, vctx)
+	if err != nil {
+		return "", stageMeta{}, err
 	}
-	lunNum, _ := strconv.Atoi(vctx[ctxKeyLUNNumber])
 
 	// Log into every portal so the LUN is reached over one path per portal;
 	// multipathd combines them into a single /dev/mapper device. Tolerate a

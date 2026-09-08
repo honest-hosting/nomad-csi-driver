@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	goqnap "github.com/honest-hosting/go-qnap"
 	"github.com/prometheus/client_golang/prometheus"
@@ -562,4 +563,118 @@ func TestResolvePath_GlobMatchesByIQNAndLUN(t *testing.T) {
 	// No match returns false.
 	_, ok = resolvePath(filepath.Join(dir, "*-iscsi-iqn.nope-lun-9"))
 	assert.False(t, ok)
+}
+
+// --- volume-context loss (NOMAD-CSI-DRIVER-MISSING-CTX-FIX.PLAN.md) ----------
+//
+// Nomad erases a volume's CSI context when `nomad volume create` is run against
+// an already-existing volume: it merges the submitted spec instead of calling
+// the plugin, and before Nomad 1.9.6 (hashicorp/nomad#24922) that merge assigned
+// the spec's (empty) context unconditionally. The LUN is untouched, so the node
+// rebuilds what it can — but unlike the local backend, not every field is
+// recoverable, and the ones that aren't must fail loudly rather than be guessed.
+
+// ctxLossNode builds a node with a SAN cache that knows one 1:1 volume
+// (LUN 42 on target 10, name "vol-a") and one shared 1:N target (index 7).
+func ctxLossNode(t *testing.T, portals ...string) *node {
+	t.Helper()
+	fc := newFakeClient()
+	fc.targets[10] = goqnap.Target{Index: 10, IQN: "iqn.qnap:t10"}
+	fc.targets[7] = goqnap.Target{Index: 7, IQN: "iqn.qnap:shared"}
+	fc.luns[42] = goqnap.LUN{Index: 42, Name: "vol-a"}
+	fc.luns[5] = goqnap.LUN{Index: 5, Name: "vol-b"}
+	n := newTestNode(&cexec.FakeRunner{}, newMemMetaStore())
+	n.san = newSANIdentityCache(fc, newSessionManager(fc, "u", "p"), 30*time.Second, zap.NewNop())
+	n.cfg = &config.QNAPConfig{Portals: portals}
+	return n
+}
+
+func TestResolveAttachIdentity_ContextIntact(t *testing.T) {
+	n := ctxLossNode(t)
+	portals, iqn, lun, err := n.resolveAttachIdentity(context.Background(),
+		externalID{LUNIndex: 42, TargetIndex: 10, OwnTarget: true, LUNName: "vol-a"}.String(),
+		map[string]string{ctxKeyPortal: "10.0.0.1:3260,10.0.1.1:3260", ctxKeyIQN: "iqn.qnap:ctx", ctxKeyLUNNumber: "3"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"10.0.0.1:3260", "10.0.1.1:3260"}, portals)
+	assert.Equal(t, "iqn.qnap:ctx", iqn, "an intact context is authoritative; no SAN lookup")
+	assert.Equal(t, 3, lun)
+}
+
+func TestResolveAttachIdentity_RebuildsFromSANAndConfig(t *testing.T) {
+	// Context fully wiped. iqn comes from the SAN via the external id, portals
+	// from this node's own config, lun from the 1:1 ownTarget flag.
+	n := ctxLossNode(t, "10.0.0.1", "10.0.1.1:3260")
+	portals, iqn, lun, err := n.resolveAttachIdentity(context.Background(),
+		externalID{LUNIndex: 42, TargetIndex: 10, OwnTarget: true, LUNName: "vol-a"}.String(),
+		map[string]string{})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"10.0.0.1:3260", "10.0.1.1:3260"}, portals, "config portals normalized to host:port")
+	assert.Equal(t, "iqn.qnap:t10", iqn)
+	assert.Equal(t, 0, lun, "a 1:1 target maps its LUN at iSCSI LUN 0")
+}
+
+func TestResolveAttachIdentity_NoPortalsToRebuildFrom(t *testing.T) {
+	// The documented gap: the qnap node normally has NO portals configured, so a
+	// wiped context leaves nothing to rebuild them from. Must be an explicit,
+	// actionable error rather than an attach against zero portals.
+	n := ctxLossNode(t) // no portals configured
+	_, _, _, err := n.resolveAttachIdentity(context.Background(),
+		externalID{LUNIndex: 42, TargetIndex: 10, OwnTarget: true, LUNName: "vol-a"}.String(),
+		map[string]string{})
+	require.Error(t, err)
+	var de *driver.Error
+	require.ErrorAs(t, err, &de)
+	assert.Equal(t, driver.CodeFailedPrecondition, de.Code)
+	assert.Contains(t, err.Error(), "qnap.portals", "error must name the config that would fix it")
+	assert.Contains(t, err.Error(), "nomad volume register", "and the recovery path")
+}
+
+func TestResolveAttachIdentity_SharedTargetLUNIsNotGuessed(t *testing.T) {
+	// Data safety: for a 1:N target the LUN number is encoded nowhere. Defaulting
+	// to 0 would attach the WRONG DEVICE, so refuse.
+	n := ctxLossNode(t, "10.0.0.1:3260")
+	_, _, _, err := n.resolveAttachIdentity(context.Background(),
+		externalID{LUNIndex: 5, TargetIndex: 7, OwnTarget: false, LUNName: "vol-b"}.String(),
+		map[string]string{ctxKeyIQN: "iqn.qnap:shared", ctxKeyPortal: "10.0.0.1:3260"})
+	require.Error(t, err)
+	var de *driver.Error
+	require.ErrorAs(t, err, &de)
+	assert.Equal(t, driver.CodeFailedPrecondition, de.Code)
+	assert.Contains(t, err.Error(), "shared")
+}
+
+func TestResolveAttachIdentity_NonNumericLUNIsRejected(t *testing.T) {
+	// Was `lunNum, _ := strconv.Atoi(...)`: a malformed value silently became LUN
+	// 0 — correct for a 1:1 target, the wrong device for a shared one.
+	n := ctxLossNode(t, "10.0.0.1:3260")
+	_, _, _, err := n.resolveAttachIdentity(context.Background(),
+		externalID{LUNIndex: 42, TargetIndex: 10, OwnTarget: true, LUNName: "vol-a"}.String(),
+		map[string]string{ctxKeyPortal: "10.0.0.1:3260", ctxKeyIQN: "iqn.qnap:t10", ctxKeyLUNNumber: "banana"})
+	require.Error(t, err)
+	var de *driver.Error
+	require.ErrorAs(t, err, &de)
+	assert.Equal(t, driver.CodeInvalidArgument, de.Code)
+}
+
+func TestResolveAttachIdentity_UnknownLUNCannotBeResolved(t *testing.T) {
+	// resolveIQN verifies the LUN name still matches (QNAP reuses indices). A
+	// stale/renamed volume must not resolve to some other tenant's target.
+	n := ctxLossNode(t, "10.0.0.1:3260")
+	_, _, _, err := n.resolveAttachIdentity(context.Background(),
+		externalID{LUNIndex: 42, TargetIndex: 10, OwnTarget: true, LUNName: "not-the-same-name"}.String(),
+		map[string]string{})
+	require.Error(t, err)
+	var de *driver.Error
+	require.ErrorAs(t, err, &de)
+	assert.Equal(t, driver.CodeFailedPrecondition, de.Code)
+}
+
+func TestResolveAttachIdentity_UnparseableIDIsDiagnosable(t *testing.T) {
+	n := ctxLossNode(t, "10.0.0.1:3260")
+	_, _, _, err := n.resolveAttachIdentity(context.Background(), "not-a-qnap-volume-id", map[string]string{})
+	require.Error(t, err)
+	var de *driver.Error
+	require.ErrorAs(t, err, &de)
+	assert.Equal(t, driver.CodeInvalidArgument, de.Code)
+	assert.Contains(t, err.Error(), "not-a-qnap-volume-id")
 }

@@ -358,8 +358,8 @@ background poller, no extra load on the SAN).
 The `make test-integration` suite scrapes the live endpoints and asserts the
 gauges/counters move across a real create→mount→unmount→delete cycle (plus a
 deliberately-rejected create for the RPC error path):
-`TestIntegration_Observability_Local` covers the monolith (`:9503`), and
-`TestIntegration_Observability_QNAP` covers both the qnap controller (`:9501`,
+`TestIntegrationLocal_Observability` covers the monolith (`:9503`), and
+`TestIntegrationQNAP_Observability` covers both the qnap controller (`:9501`,
 appliance ops) and node (`:9502`, iSCSI login / stage / staged-count) — the latter
 skips cleanly when no qnap appliance is deployed.
 
@@ -532,8 +532,8 @@ To cut a release, perform the following steps:
 - Verify unit + integration tests pass, commit & push changes
 - Export the new TAG version: `export TAG=0.0.1`                               # Set new TAG version
 - Run a build: `make build`                                                    # Build the binary with version stamping
-- Run `DOCKER_HOST=quay.io DOCKER_REPO=quay.io/honesthosting ... make package` # Push tagged image to Quay.io
-- Run `DOCKER_HOST=harbor... DOCKER_REPO=... make package`                     # Push tagged image to Harbor
+- Run `DOCKER_HOSTNAME=quay.io DOCKER_REPO=quay.io/honesthosting ... make package-quay` # Push tagged image to Quay.io
+- Run `DOCKER_HOSTNAME=harbor... DOCKER_REPO=... make package-harbor`                     # Push tagged image to Harbor
 - Run `make release`                                                           # Create a new git-tag + release on GitHub
 
 ## License

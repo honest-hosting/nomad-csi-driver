@@ -33,11 +33,11 @@ func (c *client) restartLocalPlugin(t *testing.T, node string) {
 	c.requirePluginHealthy(t, c.localPluginID, 1, false)
 }
 
-// TestIntegration_VolumeStats_Local_SurvivesPluginRestart stages a local volume,
+// TestIntegrationLocal_VolumeStats_SurvivesPluginRestart stages a local volume,
 // waits for its stats to hydrate, restarts the owning node's plugin task (wiping
 // the in-memory registry), and asserts the stats reappear with no intervening
 // re-stage — proving the reconciler rehydrated the registry from host truth.
-func TestIntegration_VolumeStats_Local_SurvivesPluginRestart(t *testing.T) {
+func TestIntegrationLocal_VolumeStats_SurvivesPluginRestart(t *testing.T) {
 	c := newClient(t)
 	c.requirePluginHealthy(t, c.localPluginID, 1, false)
 
@@ -89,14 +89,14 @@ func TestIntegration_VolumeStats_Local_SurvivesPluginRestart(t *testing.T) {
 	})
 }
 
-// TestIntegration_VolumeStats_QNAP_SurvivesPluginRestart is the qnap analogue:
+// TestIntegrationQNAP_VolumeStats_SurvivesPluginRestart is the qnap analogue:
 // stage a LUN, wait for the controller aggregate to report it, restart the owning
 // node's qnap node plugin (wiping the node's in-memory stats registry), and assert
 // the stats reappear with no re-stage — proving the node's stats reconciler
 // rehydrated the registry from live iSCSI sessions, resolving each session's
 // (IQN, LUN) → external id via the read-only SAN. SKIPS cleanly without a qnap
 // deployment / reachable controller query API.
-func TestIntegration_VolumeStats_QNAP_SurvivesPluginRestart(t *testing.T) {
+func TestIntegrationQNAP_VolumeStats_SurvivesPluginRestart(t *testing.T) {
 	c := newClient(t)
 	c.requirePluginHealthy(t, c.qnapPluginID, 1, true) // optional: skips if not deployed
 

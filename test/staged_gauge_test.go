@@ -54,7 +54,7 @@ func (c *client) restartNodePlugin(t *testing.T, node string) {
 // in-memory Inc/Dec gauge reset to 0 here (and could go negative on the later
 // unstage); the host-counted gauge stays correct because the iSCSI session
 // persists across the plugin bounce.
-func TestIntegration_StagedGauge_SurvivesPluginRestart(t *testing.T) {
+func TestIntegrationQNAP_StagedGauge_SurvivesPluginRestart(t *testing.T) {
 	c := newClient(t)
 	c.requirePluginHealthy(t, c.qnapPluginID, 1, true) // optional: skips if qnap not deployed
 
@@ -110,7 +110,7 @@ func (c *client) stagedSoft(hosts []string, port, path string) (float64, bool) {
 // INT-3: qnap iSCSI teardown works after a plugin restart that lost the in-memory
 // identity cache — the session is cleanly logged out (via host reconstruction),
 // leaving no leaked session. This is the split-brain-prevention property.
-func TestIntegration_QNAPTeardown_NoLeakAfterRestart(t *testing.T) {
+func TestIntegrationQNAP_Teardown_NoLeakAfterRestart(t *testing.T) {
 	c := newClient(t)
 	c.requirePluginHealthy(t, c.qnapPluginID, 1, true)
 
@@ -168,7 +168,7 @@ func (c *client) hasSessionTo(t *testing.T, node, iqn string) bool {
 // session left on one node while the volume moves to another lets two initiators
 // write one LUN). Requires the node plugin to have the reconciler enabled with a
 // short grace (localdev sets qnap.reconcile_enabled=true, reconcile_grace=2m).
-func TestIntegration_Reconciler_LogsOutLeakedSession(t *testing.T) {
+func TestIntegrationQNAP_Reconciler_LogsOutLeakedSession(t *testing.T) {
 	c := newClient(t)
 	c.requirePluginHealthy(t, c.qnapPluginID, 1, true) // optional: skips if qnap not deployed
 	b := qnapBackend(c)

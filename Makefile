@@ -46,7 +46,23 @@ install: ## go install ./cmd/nomad-csi-driver into GOBIN
 	@go install ./cmd/nomad-csi-driver
 .PHONY: install
 
-package: package-preflight ## Build + push the container image via Packer: make package
+package-quay: ## Build + push the container image via Packer to Quay: make package-quay
+	@if [[ ! "$(DOCKER_REPO)" =~ quay.io ]]; then \
+		echo "ERROR: set Docker Quay settings before packaging to Quay"; \
+		exit 1; \
+	fi
+	@$(MAKE) package
+.PHONY: package-quay
+
+package-harbor: ## Build + push the container image via Packer to Harbor: make package-harbor
+	@if [[ ! "$(DOCKER_REPO)" =~ harbor.klmh.co ]]; then \
+		echo "ERROR: set Docker Harbor settings before packaging to Harbor"; \
+		exit 1; \
+	fi
+	@$(MAKE) package
+.PHONY: package-quay
+
+package: package-preflight
 	@echo "Performing Packer build for 'bin/$(APP_NAME)'"
 	@packer build \
 		--var='app_build_tags=[$(PACKER_IMAGE_BUILD_TAGS)]' \
